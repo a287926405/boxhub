@@ -88,6 +88,8 @@ PKG="dist/boxhub-${VERSION}"
 rm -rf "$PKG" && mkdir -p "$PKG/bin"
 cp dist/boxd-linux-amd64 dist/boxd-linux-arm64 "$PKG/bin/"
 cp scripts/manage.sh "$PKG/manage.sh"
+# 把发布版本号写进安装脚本自述(build.sh 是唯一权威版本源,避免手动漏改)
+sed -i.bak "s/^VERSION=\".*\"/VERSION=\"$VERSION\"/" "$PKG/manage.sh" && rm -f "$PKG/manage.sh.bak"
 chmod +x "$PKG/manage.sh" "$PKG/bin/"*
 cp README.md "$PKG/README.md" 2>/dev/null || true
 (

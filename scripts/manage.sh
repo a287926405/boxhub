@@ -19,7 +19,7 @@
 
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.12.4"   # build.sh 打包时会被覆盖成实际发布版本
 
 # ==================== 配置 ====================
 INSTALL_DIR="${BOXHUB_DIR:-/opt/boxhub}"
