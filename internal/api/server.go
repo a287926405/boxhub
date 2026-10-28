@@ -80,7 +80,7 @@ type Options struct {
 	ClashSecret func() string
 	// Static 自研面板静态文件。
 	Static http.Handler
-	// ClashUI metacubexd 静态文件(可为 nil)。
+	// ClashUI 内核面板(zashboard)静态文件(可为 nil)。
 	ClashUI http.Handler
 }
 
@@ -150,10 +150,10 @@ func (s *Server) Handler(auth *Auth) http.Handler {
 	authed.HandleFunc("/api/backups/", s.handleBackupByName)
 
 	mux.Handle("/api/", auth.Middleware(authed))
-	// 把 Clash API 反代到面板同源路径下:metacubexd 在 /ui/ 下运行时,
+	// 把 Clash API 反代到面板同源路径下:内核面板在 /ui/ 下运行时,
 	// 直接连 9090 是跨域请求(浏览器会拦),反代后同源即可。
 	mux.Handle("/clash/", s.clashProxy())
-	// metacubexd 是独立的前端应用:它自己会连 Clash API(带密钥),不依赖面板会话,
+	// zashboard 是独立的前端应用:它自己会连 Clash API(带密钥),不依赖面板会话,
 	// 所以不能套 boxhub_session 认证,否则浏览器直接打开 /ui/ 只会拿到 401。
 	mux.Handle("/ui/", http.StripPrefix("/ui/", uiNoCache(s.clashUIHandler())))
 	mux.Handle("/", s.staticHandler())
@@ -162,7 +162,8 @@ func (s *Server) Handler(auth *Auth) http.Handler {
 
 // clashProxy 把 /clash/* 转发到本地 Clash API。
 //
-// metacubexd 的默认后端地址可配成 window.location.origin + "/clash",
+// zashboard 的后端地址由 /api/kernel-ui-url 以 query string 注入
+// (secondaryPath=/clash),
 // 这样浏览器只与面板端口通信,不涉及跨域和额外的防火墙放行。
 func (s *Server) clashProxy() http.Handler {
 	target := func() string { return s.clashAddr() }
@@ -199,7 +200,7 @@ func (s *Server) clashProxy() http.Handler {
 
 func (s *Server) clashUIHandler() http.Handler {
 	if s.clashUI == nil {
-		// 没装 metacubexd 时给一段可读的说明,而不是空白 404。
+		// 没装内核面板(zashboard)时给一段可读的说明,而不是空白 404。
 		// 内网环境常见:安装时下载不通被跳过。
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -212,12 +213,14 @@ background:#0e1116;color:#e6edf3;display:grid;place-items:center;height:100vh;ma
 h2{margin:0 0 12px;font-size:18px}code{background:#1c232d;padding:2px 6px;border-radius:4px;font-size:12px}
 p{color:#8b949e}ul{color:#8b949e;padding-left:20px}li{margin:6px 0}a{color:#2f81f7}</style>
 </head><body><div class="box">
-<h2>内核面板(metacubexd)未安装</h2>
+<h2>内核面板(zashboard)未安装</h2>
 <p>BoxHub 控制台本身可以正常使用,只是少了这个可视化内核面板。</p>
-<p><b>原因</b>:安装时下载 metacubexd 失败(内网环境访问 GitHub 受限很常见),脚本自动跳过了它。</p>
+<p><b>原因</b>:安装时下载 zashboard 失败(内网环境访问 GitHub 受限很常见),脚本自动跳过了它。</p>
 <p><b>怎么补装</b>:在能上网的机器上下载
-<code>https://github.com/MetaCubeX/metacubexd/releases/latest/download/compressed-dist.tgz</code>,
-解压到 <code>/opt/boxhub/data/ui/</code> 后刷新本页。</p>
+<code>https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip</code>,
+把压缩包里的 <code>dist/</code> 目录铺到 <code>/opt/boxhub/data/ui/</code>
+(要让 <code>data/ui/index.html</code> 直接存在,多一层 dist/ 会 404),再刷新本页;
+或重跑一次 <code>bash manage.sh install</code>。</p>
 <p><b>不装也可以</b>:下面这些能直接看到内核信息 ——</p>
 <ul>
 <li><a href="/">返回 BoxHub 控制台</a>(概览页有实时连接数与流量)</li>
@@ -2092,17 +2095,17 @@ func (s *Server) handleConditionTypes(w http.ResponseWriter, r *http.Request) {
 
 // handleKernelUIURL 返回内核面板(zashboard)的浏览器可达地址。
 //
-// 为什么用 9090 直连而不是走面板 /ui/ + /clash 反代:
-// zashboard 的后端地址写死为 http://<host>:9090(不像 metacubexd 有 config.js),
-// 从 80 端口页面跨源调 9090 会被 CORS 拦(sing-box 无 allow_cors 配置项,实测)。
-// 内核自己在 external_ui 目录存在时直接 serve /ui/,页面与 API 同源,零问题。
+// 契约(与 zashboard 的实现对应,不是 metacubexd 的 config.js):
+// 后端参数放在 **hash 之前的 query string** 里 —— zashboard 的 setup 页读
+// window.location.search,拿到 protocol/hostname/port/secondaryPath/secret
+// 后自动连一次后端再进主界面;写在 #/setup? 后面不生效。
+//
+// 后端指向面板同源的 /clash 反代,不是内核的 9090:
+//   - 跨源调 9090 会被 CORS 拦(sing-box 没有 allow_cors 这类配置);
+//   - zashboard 是 PWA,旧 Service Worker 会用失效缓存把面板打成 404,
+//     且 SW 注册脚本在跨源 iframe 里抛 SecurityError 导致整页白屏。
+// 同源没有这些问题,面板启动脚本(core.js)还会顺手清掉本域历史 SW。
 func (s *Server) handleKernelUIURL(w http.ResponseWriter, r *http.Request) {
-	// 内核面板走**同源路径**:页面在 <本面板 origin>/ui/,API 用 /clash 反代。
-	// 曾经的 9090 直连方案有两个坑:
-	//   1) zashboard 是 PWA,浏览器里的旧 Service Worker 会拦截 /ui 返回
-	//      失效缓存(实测 Mac 上 404 白屏,而 curl 直连一切正常);
-	//   2) SW 注册脚本在**跨源 iframe** 里抛 SecurityError,整页白屏。
-	// 同源没有跨源限制,面板启动脚本(core.js)还会顺手清掉本域历史 SW。
 	host := r.Host
 	if i := strings.LastIndex(host, ":"); i > 0 && !strings.HasPrefix(host, "[") {
 		host = host[:i]
@@ -2118,23 +2121,39 @@ func (s *Server) handleKernelUIURL(w http.ResponseWriter, r *http.Request) {
 	if _, ap, err := net.SplitHostPort(r.Host); err == nil {
 		port = ap
 	}
+	// 入口地址必须自己带上端口:面板跑在非默认端口时(BOXHUB_PORT=3036、
+	// 80 被占用退回 3036、开发机换高端口),只写 host 会让 iframe 去请求
+	// http://host/ui/ 而不是 http://host:3036/ui/,表现为"内核面板打不开"。
+	authority := host
+	if (proto == "http" && port != "80") || (proto == "https" && port != "443") {
+		authority = host + ":" + port
+	}
 	secret := ""
 	if cfg := s.store.Current(); cfg != nil {
 		secret = cfg.Inbounds.ClashAPISecret
 	}
 	// ?v=index.html 的 mtime:浏览器对"没有 Cache-Control 的静态文件"
 	// 会按 Last-Modified 做启发式长缓存 —— 换面板文件后旧 index 仍命中缓存,
-	// 里面引用的却是不存在的资源(metacubexd 的 _nuxt/*.js),表现为
+	// 里面引用的却是不存在的资源(换面板后旧的哈希 JS 文件名),表现为
 	// "内核面板打不开"(500/白屏)。入口 URL 带 mtime 版本,换文件即失效。
-	//
-	// zashboard 的后端参数实测必须放在 **hash 前的 query** 里
-	// (location.search);README 示例写在 #/setup? 后,放那里不生效。
 	vtag := s.uiVersionTag()
-	u := fmt.Sprintf("%s://%s/ui/?v=%s&disableUpgradeCore=1&protocol=%s&hostname=%s&port=%s&secondaryPath=%s#/setup",
-		proto, host, vtag, proto, host, port, "%2Fclash")
+	// hostname/port 是 zashboard 拼后端地址用的
+	// (base = `${protocol}://${host}:${port}${secondaryPath}`),
+	// 这里给的是**面板**的 host 与端口:API 走面板同源的 /clash 反代。
+	//
+	// 注意:所有参数都必须在 `#/setup` **之前**。zashboard 的 setup 页只读
+	// window.location.search;密钥要是拼在 hash 后面,它永远拿不到,
+	// 内核 Clash API 配了 secret 就会出现"面板连不上后端(401)"。
+	query := "v=" + vtag +
+		"&disableUpgradeCore=1" +
+		"&protocol=" + proto +
+		"&hostname=" + url.QueryEscape(host) +
+		"&port=" + port +
+		"&secondaryPath=%2Fclash"
 	if secret != "" {
-		u += "&secret=" + url.QueryEscape(secret)
+		query += "&secret=" + url.QueryEscape(secret)
 	}
+	u := proto + "://" + authority + "/ui/?" + query + "#/setup"
 	writeOK(w, map[string]any{"url": u})
 }
 

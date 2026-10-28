@@ -71,7 +71,7 @@ func runOnly(t *testing.T, bin, cfgPath, dir string, wait time.Duration) (bool, 
 }
 
 // kernelWithClash 启动内核后,通过 Clash API 确认链式代理确实作为可切换的
-// 代理出现在面板后端里——这正是 metacubexd 与 BoxHub 面板测速/切换所依赖的。
+// 代理出现在面板后端里——这正是 zashboard 与 BoxHub 面板测速/切换所依赖的。
 func kernelWithClash(t *testing.T, bin, cfgPath string, apiPort int, dir string) (bool, string) {
 	t.Helper()
 	cmd := exec.Command(bin, "run", "-c", cfgPath, "-D", dir)

@@ -8,8 +8,8 @@
 # 逻辑都在 scripts/manage.sh 里(可单独下载运行,便于离线与二次运维)。
 #
 # 常用变体:
-#   # 换端口(默认 3036)
-#   BOXHUB_PORT=80 curl -fsSL <本地址> | bash
+#   # 换端口(默认 80;80 被 nginx 之类占用时安装脚本会退回 3036)
+#   BOXHUB_PORT=8080 curl -fsSL <本地址> | bash
 #   # 国内直连 GitHub 不通时走镜像
 #   BOXHUB_GH_MIRROR=https://gh-proxy.com curl -fsSL <本地址> | bash
 #   # 装完直接进管理菜单

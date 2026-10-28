@@ -110,7 +110,7 @@ func Build(cfg *config.Config, ctx Context) (*SBConfig, error) {
 type Context struct {
 	// CacheFile 内核缓存路径,空表示不启用缓存。
 	CacheFile string
-	// ClashUI metacubexd 静态目录,空表示不挂载。
+	// ClashUI 内核面板(zashboard)静态目录,空表示不挂载。
 	ClashUI string
 	// RuleSetDir 规则集缓存目录。
 	RuleSetDir string

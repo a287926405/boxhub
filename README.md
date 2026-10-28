@@ -48,8 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh |
 常用变体:
 
 ```bash
-# 指定监听端口(默认 3036;想直接用 80 就写 80)
-BOXHUB_PORT=80 curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
+# 指定监听端口(默认就是 80;想换别的端口才需要写)
+BOXHUB_PORT=8080 curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
 
 # 国内直连 GitHub 不通:走 gh-proxy 类镜像
 BOXHUB_GH_MIRROR=https://gh-proxy.com curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
@@ -202,7 +202,7 @@ BoxHub 在**保存时**就把这些都拦掉,并给中文原因:
 | `auth.json` | 面板密码(salt + PBKDF2 派生值,不存明文) |
 | `kernel.log` | 内核日志 |
 | `cache.db` | 内核缓存 |
-| `ui/` | metacubexd 静态文件 |
+| `ui/` | 内核面板(zashboard)静态文件 |
 
 ### 导出 / 导入
 
@@ -225,14 +225,15 @@ BoxHub 在**保存时**就把这些都拦掉,并给中文原因:
 | 设置 | 默认 | 说明 |
 |---|---|---|
 | 混合代理端口 | 7890 | 同时支持 HTTP 与 SOCKS5 |
-| 内核面板端口 | 9090 | metacubexd 用的 Clash API |
-| 面板端口 | 3036 | 安装时用 `BOXHUB_PORT` 改 |
+| 内核面板端口 | 9090 | zashboard 用的 Clash API(面板内的 `/clash` 反代已同源转发,不必对外放行) |
+| 面板端口 | **80** | 新装机器默认 80,装完直接 `http://IP` 打开;80 被占用时安装脚本退回 3036。已装机器保留原端口,改端口用 `BOXHUB_PORT` |
 | 直连 DNS | 223.5.5.5 | 中国大陆域名用 |
 | 代理 DNS | tls://1.1.1.1 | 经代理查询,避免污染 |
 | 屏蔽 QUIC | 开 | 很多节点 UDP 转发差,关掉反而更卡 |
 | FakeIP | 开 | 走代理的域名返回占位地址 |
 
-「内核面板」入口可以直接打开 metacubexd,看实时连接、按进程/域名排查、手动测速。
+「内核面板」入口可以直接打开 [zashboard](https://github.com/Zephyruso/zashboard),看实时连接、按进程/域名排查、手动测速。
+它由安装脚本默认下载(发行包 `dist.zip`);GitHub 不通时用 `BOXHUB_GH_MIRROR` 走镜像,或按 `manage.sh help` 手动补装。
 
 ---
 
@@ -314,6 +315,6 @@ bash scripts/test-manage.sh
 本项目代码采用 MIT 许可。
 
 - **sing-box** 内核由 [SagerNet](https://github.com/SagerNet/sing-box) 提供,遵循其自身许可(GPL-3.0)
-- **metacubexd** 面板由 [MetaCubeX](https://github.com/MetaCubeX/metacubexd) 提供,遵循其自身许可
+- **zashboard** 面板由 [Zephyruso](https://github.com/Zephyruso/zashboard) 提供,遵循其自身许可
 
 BoxHub 不包含也不修改这两者的源码,仅在运行时下载并调用。

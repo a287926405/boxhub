@@ -38,7 +38,7 @@ var version = "1.0.0"
 func main() {
 	var (
 		dataDir    = flag.String("data", "/opt/boxhub/data", "数据目录")
-		listen     = flag.String("listen", "0.0.0.0:3036", "面板监听地址")
+		listen     = flag.String("listen", "0.0.0.0:80", "面板监听地址(默认 80:装完直接 http://IP 打开;非 root 调试用 -listen 127.0.0.1:3036)")
 		singBox    = flag.String("sing-box", "", "sing-box 内核路径(默认在数据目录同级 bin/ 下查找)")
 		noKernel   = flag.Bool("no-kernel", false, "只启动面板,不管理内核(调试用)")
 		showVer    = flag.Bool("version", false, "显示版本")

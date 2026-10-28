@@ -380,6 +380,25 @@ async function editRule(p) {
   }, { wide: true });
 }
 
+// 删除一条分流规则。
+//
+// 这里曾经是个"点了没反应"的坑:卡片视图与表格视图的删除按钮都调用
+// deleteRule(p),但函数从来没定义过 —— 点击时 ReferenceError 被静默吞掉,
+// 表现为"规则删不掉"。后端 DELETE /api/policies/:id 一直是好的。
+async function deleteRule(p) {
+  if (!p) return;
+  if (!p.id) { toast('这条规则没有 ID,无法删除(刷新本页后重试)', 'err', 6000); return; }
+  // 选线组(AsGroup)只是给自己生成同名出站:别的规则的出口是 group:/filter:
+  // 这类前缀引用,不会引用规则 ID,所以删除不会牵连别的规则,直接确认即可。
+  const extra = p.as_group ? '\n(这条会生成同名选线组,删除后内核面板里那个组也会消失)' : '';
+  if (!confirm(`确定删除规则「${p.name || p.id}」?${extra}`)) return;
+  try {
+    await api('DELETE', '/api/policies/' + encodeURIComponent(p.id));
+    toast('已删除规则「' + (p.name || p.id) + '」', 'ok');
+    await renderPage();
+  } catch (e) { toast(e.message, 'err', 6000); }
+}
+
 function flattenMatchToConditions(m) {
   if (!m) return [];
   const out = [];
@@ -756,7 +775,7 @@ function openKernelUINewTab() {
 }
 
 async function renderKernelUI(root) {
-  // 先确认 metacubexd 是否已安装
+  // 先确认内核面板(zashboard)是否已安装
   let ok = true;
   try {
     const r = await fetch('/ui/', { method: 'HEAD' });
@@ -768,21 +787,24 @@ async function renderKernelUI(root) {
     h('button', { class: 'sm', onclick: openKernelUINewTab }, '新窗口打开'))));
 
   if (!ok) {
-    root.append(card('', '', '', '', emptyState('▦', '内核面板(zashboard)未安装', 
-      '安装时下载面板失败(内网访问 GitHub 受限)。可手动补装:把 zashboard 发行包解压到 /opt/boxhub/data/ui/ 后刷新本页')));
+    root.append(card('', '', '', '', emptyState('▦', '内核面板(zashboard)未安装',
+      '安装时下载面板失败(内网访问 GitHub 受限)。可手动补装:把 zashboard 发行包' +
+      '(https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip)' +
+      '解压后的 dist/ 内容放到 /opt/boxhub/data/ui/ 后刷新本页;或重跑 bash manage.sh install')));
     return;
   }
 
-  // 优先 zashboard:内核 9090 直连(页面与 API 同源,免 CORS);
-  // 拿不到地址或加载失败时回退到 /ui/(同源反代,metacubexd 兼容)。
+  // 入口地址由 /api/kernel-ui-url 生成:同源 /ui/ 加载 zashboard,
+  // 后端参数(protocol/hostname/port/secondaryPath/secret)走 query string,
+  // API 经面板的 /clash 反代,不涉及跨域,也不用额外放行 9090。
+  // 拿不到地址时退回 /ui/ 默认入口(面板会引导用户填后端)。
   let kernelURL = '/ui/';
-  let badge = '内核面板';
+  let badge = '内核面板(zashboard)';
   try {
     const r = await api('GET', '/api/kernel-ui-url');
     const probe = await fetch(r.url, { method: 'HEAD', mode: 'no-cors' }).then(() => true).catch(() => false);
-    if (probe) { kernelURL = r.url; badge = 'zashboard(内核 9090 直连)'; }
-    else badge = 'metacubexd(同源反代)';
-  } catch (e) { badge = 'metacubexd(同源反代)'; }
+    if (probe) { kernelURL = r.url; badge = '内核面板(zashboard)'; }
+  } catch (e) { /* 回退到 /ui/ 默认入口 */ }
   const wrap = h('div', { class: 'card frame-wrap', style: { padding: 0 } },
     h('div', { class: 'frame-bar' },
       h('span', { class: 'badge info' }, h('span', { class: 'dot' }), badge),

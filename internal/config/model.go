@@ -152,7 +152,7 @@ type InboundSettings struct {
 	TUNStack   string `json:"tun_stack"`
 	// TunInterfaceName 留空时使用内核默认。
 	TunAddress []string `json:"tun_address"`
-	// ClashAPI 提供 metacubexd 面板所需的 REST 接口。
+	// ClashAPI 提供内核面板(zashboard)所需的 REST 接口。
 	ClashAPI       bool   `json:"clash_api"`
 	ClashAPIPort   int    `json:"clash_api_port"`
 	ClashAPISecret string `json:"clash_api_secret"`

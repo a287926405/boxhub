@@ -1,6 +1,6 @@
 package render
 
-// 出站 tag 分配:内核面板(metacubexd)里显示的就是这些 tag,
+// 出站 tag 分配:内核面板(zashboard)里显示的就是这些 tag,
 // 用 node:a1b2c3 这种内部 ID 用户根本认不出哪个是哪个节点。
 //
 // 规则:

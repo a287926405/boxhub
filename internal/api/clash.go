@@ -2,7 +2,7 @@ package api
 
 // Clash API 客户端:用于选中节点、测速、读取实时连接。
 // sing-box 的 experimental.clash_api 与 Clash 的 REST 接口兼容,
-// 因此 metacubexd 可以直接作为内核面板使用,BoxHub 面板也复用同一套接口。
+// 因此 zashboard 可以直接作为内核面板使用,BoxHub 面板也复用同一套接口。
 
 import (
 	"context"

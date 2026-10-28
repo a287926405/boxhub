@@ -19,16 +19,29 @@
 
 set -o pipefail
 
-VERSION="1.12.4"   # build.sh 打包时会被覆盖成实际发布版本
+VERSION="1.13.0"   # build.sh 打包时会被覆盖成实际发布版本
 
 # ==================== 配置 ====================
 INSTALL_DIR="${BOXHUB_DIR:-/opt/boxhub}"
 DATA_DIR="${INSTALL_DIR}/data"
 BIN_DIR="${INSTALL_DIR}/bin"
 SERVICE_NAME="boxhub"
-PANEL_PORT="${BOXHUB_PORT:-3036}"
-# 已装过的机器:未显式指定端口时沿用服务文件里现存的端口。
-# 否则用户把面板改到 80 后,一次 install 升级就被默认 3036 打回原形。
+# ==================== 面板端口 ====================
+# 默认端口 80:装完直接 http://<IP> 就能开,不用记端口。
+#   - 80 是特权端口,但服务以 root 跑(systemd 单元还额外给了
+#     CAP_NET_BIND_SERVICE),绑定没有问题;
+#   - 80 也最容易被 nginx / apache 占着,所以占用时不硬碰:
+#     告警并退回历史默认 3036,保证安装能走完。
+PANEL_PORT_DEFAULT="80"
+PANEL_PORT_FALLBACK="3036"
+PANEL_PORT="${BOXHUB_PORT:-$PANEL_PORT_DEFAULT}"
+PORT_EXPLICIT=0
+[ -n "${BOXHUB_PORT:-}" ] && PORT_EXPLICIT=1
+# 已装机器现存端口(空 = 全新安装)。
+EXISTING_PORT=""
+# 已装机器的端口原样保留(哪怕它等于历史默认 3036):
+# 升级不该把用户已有的书签 / 防火墙规则 / 设备配置打掉。
+# 只有显式 BOXHUB_PORT=xx 才能改变它。
 detect_existing_port() {
     local svc=""
     if [ "$INIT" = "systemd" ]; then
@@ -37,16 +50,60 @@ detect_existing_port() {
         svc="/etc/init.d/${SERVICE_NAME}"
     fi
     [ -f "$svc" ] || return 0
-    local cur
     # 从 -listen 0.0.0.0:PORT / [::]:PORT 提取端口
-    cur=$(grep -oE '\-listen [^ ]*[:%][0-9]+' "$svc" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)
-    if [ -n "$cur" ] && [ "$cur" != "3036" ]; then
-        # 只有现存端口不是默认值(即用户改过)才沿用;
-        # 从未改过的机器维持 BOXHUB_PORT/3036 语义
-        PANEL_PORT="$cur"
-        info "沿用已安装的端口: $PANEL_PORT(用 BOXHUB_PORT=xx 可覆盖)" >&2
+    EXISTING_PORT=$(grep -oE '\-listen [^ ]*[:%][0-9]+' "$svc" 2>/dev/null | grep -oE '[0-9]+$' | head -n1)
+    [ -n "$EXISTING_PORT" ] || return 0
+    if [ "$PORT_EXPLICIT" = "1" ]; then
+        info "按 BOXHUB_PORT 指定的端口安装: $PANEL_PORT(现存 $EXISTING_PORT)" >&2
+    else
+        PANEL_PORT="$EXISTING_PORT"
+    fi
+    return 0
+}
+
+# port_busy <端口>:TCP LISTEN 探测。直接读 /proc/net/tcp(6),
+# 不依赖 ss / netstat / lsof 这些不一定装的家伙(容器里常常一个都没有)。
+# BOXHUB_PROC_NET_TCP / _TCP6 只为测试留的注入点(见 scripts/test-manage.sh),
+# 正常安装不要设:默认就是内核的真实监听表。
+port_busy() {
+    local port=$1 f hex
+    hex=$(printf '%04X' "$port") || return 1
+    for f in "${BOXHUB_PROC_NET_TCP:-/proc/net/tcp}" "${BOXHUB_PROC_NET_TCP6:-/proc/net/tcp6}"; do
+        [ -r "$f" ] || continue
+        if awk -v p="$hex" '$4 == "0A" { split($2, a, ":"); if (a[2] == p) { found = 1; exit } } END { exit !found }' "$f"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 端口冲突处理:必须在写服务文件之前调用,否则会装出一个起不来的服务。
+resolve_panel_port() {
+    # 沿用现存端口时,"被占用"是正常的 —— 占用者就是还没重启的旧 boxhub
+    [ "$PANEL_PORT" = "$EXISTING_PORT" ] && return 0
+    port_busy "$PANEL_PORT" || return 0
+    if [ "$PORT_EXPLICIT" = "1" ]; then
+        die "端口 $PANEL_PORT 已被其他程序占用。换个端口(BOXHUB_PORT=8080)或先停掉占用它的服务(ss -lntp | grep :$PANEL_PORT)"
+    fi
+    if [ "$PANEL_PORT" = "$PANEL_PORT_DEFAULT" ] && ! port_busy "$PANEL_PORT_FALLBACK"; then
+        warn "端口 $PANEL_PORT_DEFAULT 已被占用(常见于 nginx / apache),面板退回 $PANEL_PORT_FALLBACK"
+        warn "想让面板用别的端口:BOXHUB_PORT=8080 bash manage.sh install"
+        PANEL_PORT="$PANEL_PORT_FALLBACK"
+        return 0
+    fi
+    die "端口 $PANEL_PORT 与 $PANEL_PORT_FALLBACK 都被占用,请用 BOXHUB_PORT=<端口> 指定一个空闲端口"
+}
+
+# 面板访问地址(80 端口不写 ":80",直接 http://IP)
+panel_url() {
+    local host=$1
+    if [ "$PANEL_PORT" = "80" ]; then
+        printf 'http://%s' "$host"
+    else
+        printf 'http://%s:%s' "$host" "$PANEL_PORT"
     fi
 }
+
 # 下载源
 GITHUB_REPO="${BOXHUB_REPO:-a287926405/boxhub}"
 RELEASE_BASE="${BOXHUB_RELEASE_BASE:-}"
@@ -55,7 +112,13 @@ RELEASE_BASE="${BOXHUB_RELEASE_BASE:-}"
 GH_MIRROR="${BOXHUB_GH_MIRROR:-}"
 SINGBOX_REPO="SagerNet/sing-box"
 SINGBOX_VERSION="${BOXHUB_SINGBOX_VERSION:-}"   # 留空 = 用 Latest
-METACUBEXD_REPO="MetaCubeX/metacubexd"
+# 内核面板:zashboard(Zephyruso/zashboard)。
+# 它源自 metacubexd,但**没有 config.js**:后端参数由入口 URL 的 query string
+# 提供(protocol/hostname/port/secondaryPath/secret),契约见 internal/api/server.go
+# 的 handleKernelUIURL。发行包是 Release 资产 dist.zip(不是 metacubexd 的
+# compressed-dist.tgz,装错面板会导致 #kernel-ui 打不开)。
+ZASHBOARD_REPO="Zephyruso/zashboard"
+ZASHBOARD_ASSET="dist.zip"
 
 # ==================== 输出 ====================
 if [ -t 1 ]; then
@@ -247,7 +310,7 @@ install_singbox() {
     echo "$bin"
 }
 
-# 下载 metacubexd(可选,失败不影响主功能)
+# 下载内核面板 zashboard(可选,失败不影响主功能)
 # 去掉面板的 PWA/Service Worker:SW 在浏览器里缓存旧文件,
 # boxd/内核升级换文件后 SW 会用失效缓存把 /ui 打成 404("内核面板打不开"根因);
 # 且 SW 注册脚本在跨源 iframe 中抛 SecurityError 导致整页白屏。
@@ -277,48 +340,104 @@ try {
 } catch (e) {}
 RJ
     if [ -f "$dir/index.html" ]; then
-        sed -i 's|<script[^>]*workbox[^>]*></script>||g; s|<script[^>]*registerSW[^>]*></script>||g' "$dir/index.html" 2>/dev/null || true
+        # 注意:不能写 `sed -i`(BSD sed 的 -i 需要参数,GNU 的不需要),
+        # 在 mac/部分精简系统上会静默失败,留下引用已删除 workbox-*.js 的
+        # <script> 标签(404)与 registerSW.js(重新注册 SW)。
+        # 用"输出到临时文件再 mv"的写法,两种 sed 都成立。
+        local idx="$dir/index.html" tmpf="$dir/.index.html.tmp"
+        if sed -e 's|<script[^>]*workbox[^>]*></script>||g' \
+               -e 's|<script[^>]*registerSW[^>]*></script>||g' \
+               -e 's|<script[^>]*id="vite-plugin-pwa:register-sw"[^>]*></script>||g' \
+               "$idx" > "$tmpf" 2>/dev/null; then
+            mv "$tmpf" "$idx"
+        else
+            rm -f "$tmpf"
+        fi
     fi
     rm -f "$dir"/workbox-*.js 2>/dev/null || true
+}
+
+# unzip_archive <zip> <目标目录>:把 zip 解到目录里。
+# zashboard 发行包是 zip,而精简系统(debian-slim / alpine 基础镜像)经常没有 unzip,
+# 所以按可用性依次退到 bsdtar / busybox / python3,都不行才尝试装一次 unzip。
+unzip_archive() {
+    local zip=$1 dest=$2
+    mkdir -p "$dest" || return 1
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -oq "$zip" -d "$dest" && return 0
+    elif command -v bsdtar >/dev/null 2>&1; then
+        bsdtar -xf "$zip" -C "$dest" >/dev/null 2>&1 && return 0
+    elif command -v busybox >/dev/null 2>&1 && busybox unzip --help 2>&1 | grep -q unzip; then
+        busybox unzip -q -o "$zip" -d "$dest" && return 0
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$zip" "$dest" <<'PY' >/dev/null 2>&1 && return 0
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    z.extractall(sys.argv[2])
+PY
+    fi
+    # 实在没有解压工具:装一个再试(内网 apt 不通时会失败,那就跳过面板)
+    case "$OS_ID" in
+        alpine) apk add --no-cache unzip >/dev/null 2>&1 ;;
+        *)      apt-get install -y -qq unzip >/dev/null 2>&1 ;;
+    esac
+    command -v unzip >/dev/null 2>&1 || return 1
+    unzip -oq "$zip" -d "$dest"
 }
 
 install_clash_ui() {
     # 可选项:内网/受限网络下载不通时不能卡住整个安装
     if [ "${BOXHUB_NO_CLASH_UI:-0}" = "1" ]; then
-        info "已跳过 metacubexd(BOXHUB_NO_CLASH_UI=1)"
+        info "已跳过内核面板 zashboard(BOXHUB_NO_CLASH_UI=1)"
         return 0
     fi
-    step_stdout "下载内核面板 metacubexd(可选)"
-    local tmp=$1 dest
+    step_stdout "下载内核面板 zashboard(可选)"
+    local tmp=$1 dest url zip
     dest="${DATA_DIR}/ui"
-    local url="https://github.com/${METACUBEXD_REPO}/releases/latest/download/compressed-dist.tgz"
-    # 60 秒拿不到就跳过
-    if ! timeout 60 sh -c "if [ \"$DL\" = curl ]; then curl -fsSL --connect-timeout 15 --max-time 55 -o '$tmp/ui.tgz' '$url'; else wget -q --timeout=15 --tries=1 -O '$tmp/ui.tgz' '$url'; fi" 2>/dev/null; then
-        warn "metacubexd 下载失败,跳过(BoxHub 面板不受影响;补装方法见 manage.sh help)"
+    zip="$tmp/zashboard.zip"
+    # 和 sing-box 一样支持 GitHub 镜像:国内直连 releases 不通时这是唯一出路。
+    # BOXHUB_ZASHBOARD_URL 可整条替换(锁定某个版本、指向自建源,或本地 file:// 路径)。
+    url="${BOXHUB_ZASHBOARD_URL:-}"
+    [ -n "$url" ] || url=$(gh_url "https://github.com/${ZASHBOARD_REPO}/releases/latest/download/${ZASHBOARD_ASSET}")
+    # dist.zip 约 9MB;拿不到就跳过,不重试第二次(以前"先探测再重下"要下两遍)
+    if ! timeout 240 sh -c "if [ \"$DL\" = curl ]; then curl -fsSL --connect-timeout 15 --max-time 230 -o '$zip' '$url'; else wget -q --timeout=15 --tries=1 -O '$zip' '$url'; fi" 2>/dev/null; then
+        warn "zashboard 下载失败,已跳过(BoxHub 控制台不受影响): $url"
+        warn "  走镜像:BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
+        warn "  手动补:下载 $url 解压到 $dest(保留 index.html 在根)后刷新内核面板"
         return 0
     fi
-    if fetch "$url" "$tmp/ui.tgz" 2>/dev/null; then
-        mkdir -p "$tmp/ui" && tar -xzf "$tmp/ui.tgz" -C "$tmp/ui" 2>/dev/null || {
-            warn "metacubexd 解压失败,跳过"
-            return 0
-        }
-        rm -rf "$dest"
-        mkdir -p "$dest"
-        cp -a "$tmp/ui/." "$dest/" || { warn "复制失败,跳过"; return 0; }
-        # 让 metacubexd 默认连到本机 Clash API
-        # 后端走 BoxHub 面板的同源反代(/clash),避免跨域与额外放行 9090。
-        # 注意:这里必须用 <<'EOF' 原样写入,不要让 shell 展开 $ 变量。
-        cat > "$dest/config.js" <<'EOF'
-window.__METACUBEXD_CONFIG__ = {
-  defaultBackendURL: window.location.origin + "/clash",
-  githubToken: "",    strip_pwa "$dest"
-}
-EOF
-        info "metacubexd 已安装"
-    else
-        warn "metacubexd 下载失败,跳过(BoxHub 面板不受影响)"
+    local work="$tmp/zashboard"
+    rm -rf "$work"
+    if ! unzip_archive "$zip" "$work"; then
+        warn "zashboard 解压失败(缺少 unzip/bsdtar/python3),已跳过"
+        warn "  手动补:apt-get install -y unzip 后重跑安装,或自行解压 $url 到 $dest"
+        return 0
     fi
+    # dist.zip 里带一层 dist/ 前缀,直接铺到 /ui 根会让 /ui/index.html 变 404
+    if [ -d "$work/dist" ] && [ -f "$work/dist/index.html" ]; then
+        work="$work/dist"
+    fi
+    # 校验产物完整再动安装目录:任何一步失败都不碰现有面板
+    if [ ! -f "$work/index.html" ]; then
+        warn "zashboard 包里没有 index.html,已跳过(不覆盖现有面板)"
+        return 0
+    fi
+    if [ ! -d "$work/assets" ] && [ -z "$(find "$work" -name '*.js' -print -quit 2>/dev/null)" ]; then
+        warn "zashboard 包里没有 JS 资源,已跳过(不覆盖现有面板)"
+        return 0
+    fi
+    rm -rf "$dest"
+    mkdir -p "$dest" || { warn "创建 $dest 失败,已跳过"; return 0; }
+    if ! cp -a "$work/." "$dest/"; then
+        warn "复制 zashboard 失败,已跳过"
+        return 0
+    fi
+    # zashboard 是纯 SPA:后端地址来自入口 URL 的 query string(由 boxd 生成),
+    # 不需要 config.js。这里只清掉 PWA/Service Worker,避免旧缓存把 /ui 打成 404。
+    strip_pwa "$dest"
+    info "zashboard 已安装 → $dest"
 }
+
 
 backup_existing() {
     local dest=$1
@@ -502,6 +621,13 @@ do_install() {
     detect_container
     detect_downloader
     detect_existing_port
+    # 端口冲突要在写服务文件之前处理掉:默认 80 经常撞上 nginx
+    resolve_panel_port
+    if [ -n "$EXISTING_PORT" ] && [ "$PANEL_PORT" = "$EXISTING_PORT" ] && [ "$PORT_EXPLICIT" != "1" ]; then
+        info "面板端口: $PANEL_PORT(沿用已安装的端口,改端口用 BOXHUB_PORT=xx)"
+    else
+        info "面板端口: $PANEL_PORT"
+    fi
     # 内网环境:apt 与 GitHub 都可能不通,提前确认关键工具
     if ! command -v tar >/dev/null 2>&1 || ! command -v gzip >/dev/null 2>&1; then
         die "缺少 tar/gzip,请先安装"
@@ -594,14 +720,15 @@ show_access_info() {
     printf '%s║          BoxHub 安装完成                     ║%s\n' "$GREEN$BOLD" "$NC"
     printf '%s╚══════════════════════════════════════════════╝%s\n' "$GREEN$BOLD" "$NC"
     echo
-    printf '  面板地址: %shttp://%s:%s%s\n' "$BLUE" "$ip" "$PANEL_PORT" "$NC"
-    printf '  本机访问: %shttp://127.0.0.1:%s%s\n' "$BLUE" "$PANEL_PORT" "$NC"
-    printf '  内核面板: %shttp://%s:%s/ui/%s\n' "$BLUE" "$ip" "$PANEL_PORT" "$NC"
+    printf '  面板地址: %s%s%s\n' "$BLUE" "$(panel_url "$ip")" "$NC"
+    printf '  本机访问: %s%s%s\n' "$BLUE" "$(panel_url 127.0.0.1)" "$NC"
+    printf '  内核面板: %s%s/ui/%s\n' "$BLUE" "$(panel_url "$ip")" "$NC"
     echo
     printf '  %s首次使用请打开面板设置访问密码%s\n' "$YELLOW" "$NC"
     echo
     printf '  安装目录: %s\n' "$INSTALL_DIR"
     printf '  数据目录: %s\n' "$DATA_DIR"
+    printf '  面板端口: %s\n' "$PANEL_PORT"
     printf '  代理端口: 7890 (混合 HTTP/SOCKS5)\n'
     echo
     printf '  常用命令:\n'
@@ -638,6 +765,14 @@ do_status() {
         printf '服务状态: %s运行中%s\n' "$GREEN" "$NC"
     else
         printf '服务状态: %s未运行%s\n' "$RED" "$NC"
+    fi
+    # 面板端口以服务文件里实际写的为准(老机器可能停在 3036)
+    detect_existing_port
+    printf '面板端口: %s(%s)\n' "$PANEL_PORT" "$(panel_url "$(get_lan_ip)")"
+    if [ -f "$DATA_DIR/ui/index.html" ]; then
+        printf '内核面板: %szashboard 已安装%s\n' "$GREEN" "$NC"
+    else
+        printf '内核面板: %s未安装(bash manage.sh install 可补装)%s\n' "$YELLOW" "$NC"
     fi
     printf '安装目录: %s\n' "$INSTALL_DIR"
     if [ -f "$DATA_DIR/config.json" ]; then
@@ -677,6 +812,9 @@ do_diagnose() {
     # 必须先探测系统类型,否则 INIT 为空会让 service_running 一律判定"未运行"
     detect_os
     detect_arch
+    # 端口以服务文件里的为准:默认已是 80,老机器可能还是 3036,
+    # 不探测就会误报"面板无响应"
+    detect_existing_port
     echo
     printf '%sBoxHub 诊断%s\n' "$BOLD" "$NC"
     echo "════════════════════════════════════════"
@@ -694,6 +832,12 @@ do_diagnose() {
             printf '   %s %s (缺失)\n' "$RED✗$NC" "$f"
         fi
     done
+    # 内核面板是可选组件:没装不影响控制台,但"内核面板打不开"多半就是它
+    if [ -f "$DATA_DIR/ui/index.html" ]; then
+        printf '   %s %s (内核面板 zashboard)\n' "$GREEN✓$NC" "$DATA_DIR/ui"
+    else
+        printf '   %s %s (未装:GitHub 下载不通时会被跳过;manage.sh help 里有补装方法)\n' "$YELLOW!$NC" "$DATA_DIR/ui"
+    fi
     echo
     echo "3) 服务状态"
     if service_running; then
@@ -894,12 +1038,26 @@ BoxHub 安装管理脚本 v${VERSION}
 
 环境变量:
   BOXHUB_DIR                 安装目录(默认 /opt/boxhub)
-  BOXHUB_PORT                面板端口(默认 3036)
+  BOXHUB_PORT                面板端口(默认 80;80 被占用时自动退回 3036。
+                             已经装过的机器默认沿用原端口,要用这个变量才会改)
+  BOXHUB_NO_CLASH_UI=1       跳过内核面板 zashboard 的下载(离线/内网部署)
+  BOXHUB_ZASHBOARD_URL       内核面板发行包地址(默认 GitHub 最新 dist.zip;
+                             可锁版本、指向自建源或本地 file:// 路径)
   BOXHUB_SINGBOX_VERSION     指定 sing-box 版本(如 v1.14.4)
   BOXHUB_REPO                面板下载仓库(默认内置)
+  BOXHUB_GH_MIRROR           GitHub 下载镜像前缀(如 https://gh-proxy.com)
   BOXHUB_LOCAL_BOXD          使用本地 boxd 文件安装(离线部署)
+  BOXHUB_LOCAL_SINGBOX       使用本地 sing-box 内核(离线部署)
   BOXHUB_FORCE=1             卸载时不交互
   BOXHUB_KEEP_DATA=1         卸载时保留配置(配合 FORCE)
+
+内核面板(zashboard)手动补装:
+  # 发行包是 Release 资产 dist.zip,解压后把里面的 dist/ 内容铺到 data/ui/,
+  # 保证 data/ui/index.html 存在(带一层 dist/ 会 404)。
+  curl -fsSL -o zashboard.zip https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+  unzip -o zashboard.zip -d /tmp/zab && mkdir -p /opt/boxhub/data/ui
+  cp -a /tmp/zab/dist/. /opt/boxhub/data/ui/
+  # 国内直连 GitHub 不通时,整体走镜像:BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install
 
 示例:
   sudo bash manage.sh install
