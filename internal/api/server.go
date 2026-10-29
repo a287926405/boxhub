@@ -1388,9 +1388,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			if ib.TUNStack != "" {
 				cfg.Inbounds.TUNStack = ib.TUNStack
 			}
+			if ib.DNSPort > 0 {
+				cfg.Inbounds.DNSPort = ib.DNSPort
+			}
 			cfg.Inbounds.Mixed = ib.Mixed
 			cfg.Inbounds.TUN = ib.TUN
 			cfg.Inbounds.TUNAutoRoute = ib.TUNAutoRoute
+			cfg.Inbounds.DNSListen = ib.DNSListen
 			cfg.Inbounds.AllowLAN = ib.AllowLAN
 			cfg.Inbounds.BlockQUIC = ib.BlockQUIC
 			cfg.Inbounds.ClashAPI = ib.ClashAPI

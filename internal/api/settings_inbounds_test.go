@@ -59,7 +59,7 @@ func TestSettingsTUNAutoRouteRoundTrip(t *testing.T) {
 	}
 	s := newSettingsServer(t)
 
-	putSettings(t, s, `{"inbounds":{"tun":true,"tun_auto_route":true,"sniff":true}}`)
+	putSettings(t, s, `{"inbounds":{"tun":true,"tun_auto_route":true,"sniff":true,"dns_listen":true}}`)
 	cfg := s.store.Current()
 	if !cfg.Inbounds.TUNAutoRoute {
 		t.Fatal("tun_auto_route=true 未保存:网关模式在面板上永远开不了")
@@ -67,11 +67,17 @@ func TestSettingsTUNAutoRouteRoundTrip(t *testing.T) {
 	if !cfg.Inbounds.Sniff {
 		t.Fatal("sniff=true 未保存")
 	}
+	if !cfg.Inbounds.DNSListen {
+		t.Fatal("dns_listen=true 未保存")
+	}
 
 	// 再保存一次不带这些字段(零值),确认是显式覆盖语义,且不炸。
 	putSettings(t, s, `{"inbounds":{"tun":true}}`)
 	cfg = s.store.Current()
 	if cfg.Inbounds.TUNAutoRoute {
 		t.Fatal("tun_auto_route 应随请求显式关闭")
+	}
+	if cfg.Inbounds.DNSListen {
+		t.Fatal("dns_listen 应随请求显式关闭")
 	}
 }

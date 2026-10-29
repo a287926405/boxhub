@@ -13,9 +13,12 @@ package render
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"sort"
 	"strings"
+	"syscall"
 
 	"boxhub/internal/config"
 )
@@ -777,10 +780,46 @@ func buildInbounds(cfg *config.Config) ([]SBInbound, error) {
 			MTU:         9000,
 		})
 	}
+	if cfg.DNS.Hijack {
+		if ib := dnsInbound(cfg.Inbounds.DNSListen, cfg.Inbounds.DNSPort); ib != nil {
+			out = append(out, *ib)
+		}
+	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("入站: 至少需要开启一个(混合端口或 TUN)")
 	}
+	// 渲染完成的入站 tag 快照,供 inboundTags() 在 buildRoute 里引用,
+	// 保证嗅探规则覆盖本次真正生成出来的全部入站。
+	generatedInboundTags = generatedInboundTags[:0]
+	for _, ib := range out {
+		generatedInboundTags = append(generatedInboundTags, ib.Tag)
+	}
 	return out, nil
+}
+
+// dnsInbound 构造 53 端口的 DNS 入站(direct inbound,查询交给 hijack-dns)。
+// 网关模式下局域网设备把 DNS 指向本机,在这里进入内核按分流规则解析。
+//
+// 端口被占用(例如手工装过 dnsmasq)时返回 nil:让内核沿用现有入口,
+// 而不是绑定失败导致整个内核起不来。权限不足等其它错误多半出现在
+// 无 root 的测试环境,此时保留入站交给真实内核处理。
+func dnsInbound(enabled bool, port int) *SBInbound {
+	if !enabled {
+		return nil
+	}
+	if port <= 0 {
+		port = 53
+	}
+	if pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port)); err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return nil
+		}
+	} else {
+		pc.Close()
+	}
+	return &SBInbound{
+		Type: "direct", Tag: "dns-in", Listen: "0.0.0.0", ListenPort: port,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,6 +1166,11 @@ func hasMembers(g config.Group, r *config.Resolver) bool {
 }
 
 func inboundTags(cfg *config.Config) []string {
+	// buildInbounds 已经渲染过:以实际生成结果为准(含 dns-in,
+	// 不含端口被占用时跳过的入站)。
+	if generatedInboundTags != nil {
+		return generatedInboundTags
+	}
 	var out []string
 	if cfg.Inbounds.Mixed {
 		out = append(out, "mixed-in")
@@ -1136,6 +1180,10 @@ func inboundTags(cfg *config.Config) []string {
 	}
 	return out
 }
+
+// generatedInboundTags 最近一次 buildInbounds 渲染出的入站 tag。
+// Build 串行执行(入站先于路由),包级快照与 generatedOutbounds 同一模式。
+var generatedInboundTags []string
 
 // ruleSetTag 生成稳定、合法的规则集 tag(长度受限,只保留安全字符)。
 func ruleSetTag(raw string) string {

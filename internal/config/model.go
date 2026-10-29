@@ -64,6 +64,8 @@ func NewDefault() *Config {
 			Mixed: true,
 			MixedListen: "0.0.0.0",
 			MixedPort:   7890,
+			DNSListen:   true,
+			DNSPort:     53,
 			ClashAPI:    true,
 			ClashAPIPort: 9090,
 			AllowLAN:    true,
@@ -152,6 +154,11 @@ type InboundSettings struct {
 	TUNStack   string `json:"tun_stack"`
 	// TunInterfaceName 留空时使用内核默认。
 	TunAddress []string `json:"tun_address"`
+	// DNSListen 监听 53 端口作为局域网 DNS 入口。
+	// 网关模式下局域网设备把 DNS 指向本机,查询由内核 hijack-dns 按分流规则
+	// 解析,不再依赖手工安装 dnsmasq。端口被占用时渲染阶段自动跳过。
+	DNSListen bool `json:"dns_listen"`
+	DNSPort   int  `json:"dns_port"`
 	// ClashAPI 提供内核面板(zashboard)所需的 REST 接口。
 	ClashAPI       bool   `json:"clash_api"`
 	ClashAPIPort   int    `json:"clash_api_port"`
