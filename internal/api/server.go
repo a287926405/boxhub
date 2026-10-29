@@ -340,6 +340,23 @@ func (s *Server) apply(mutate func(cfg *config.Config) error) (*applyResult, err
 	if buildErr != nil {
 		return nil, buildErr
 	}
+	// 开了 53 端口 DNS 入口却没生成入站,说明端口被别的程序占了。
+	// 这种情况必须让用户看见:网关模式下所有设备都把 DNS 指向本机,
+	// 入站没起来就是全网 DNS 超时(浏览器 ERR_NAME_NOT_RESOLVED)。
+	if next.Inbounds.DNSListen && next.DNS.Hijack {
+		has := false
+		for _, ib := range sb.Inbounds {
+			if ib.Tag == "dns-in" {
+				has = true
+				break
+			}
+		}
+		if !has {
+			warns = append(warns, fmt.Sprintf(
+				"53 端口被其它程序占用,%d 端口 DNS 入口没有生成;局域网设备的 DNS 会超时,请先停掉占用者(dnsmasq 等)",
+				next.Inbounds.DNSPort))
+		}
+	}
 	raw, err := sb.Marshal()
 	if err != nil {
 		return nil, err
@@ -388,6 +405,9 @@ func (s *Server) build(cfg *config.Config) (*render.SBConfig, error) {
 		CacheFile:  filepath.Join(s.dataDir, "cache.db"),
 		ClashUI:    s.clashUIPath(),
 		RuleSetDir: filepath.Join(s.dataDir, "rules"),
+		// 渲染时旧内核还活着并占着 53 端口,要告诉渲染层"这个端口是我自己的",
+		// 否则 dns-in 会被当成端口冲突静默丢掉,重启后局域网 DNS 全挂。
+		KernelRunning: s.kernel.Status().Running,
 	})
 }
 

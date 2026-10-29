@@ -118,3 +118,37 @@ func TestDNSInboundSkippedWhenPortBusy(t *testing.T) {
 		t.Fatalf("端口 %d 被占用时仍生成了 dns-in,内核会绑定失败起不来", busy)
 	}
 }
+
+// 内核正在运行时,53 端口是被"即将被替换掉的旧内核"自己占着的。
+//
+// 这是个真实事故:面板上改一次设置,boxd 先渲染新配置、再停旧内核。
+// 渲染那一刻旧内核还活着占着 53,端口探测拿到 EADDRINUSE,于是
+// dns-in 被当成"端口被别的程序占用"静默删掉。新内核起来后没人监听 53,
+// 局域网所有设备的 DNS 全部超时——电脑 ERR_NAME_NOT_RESOLVED 上不了网,
+// 手机因为不走网关 DNS 所以看着一切正常,极易误判成"只有电脑坏了"。
+func TestDNSInboundKeptWhenKernelRunningHoldsPort(t *testing.T) {
+	pc, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	busy := pc.LocalAddr().(*net.UDPAddr).Port
+
+	cfg := config.NewDefault()
+	cfg.Inbounds.DNSListen = true
+	cfg.Inbounds.DNSPort = busy
+
+	sb, err := render.Build(cfg, render.Context{KernelRunning: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ib := range sb.Inbounds {
+		if ib.Tag == "dns-in" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("内核正在运行时端口必然被自己占着,不能据此删掉 dns-in,否则重启后局域网 DNS 全挂")
+	}
+}

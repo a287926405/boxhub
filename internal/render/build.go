@@ -48,7 +48,7 @@ func Build(cfg *config.Config, ctx Context) (*SBConfig, error) {
 	}
 
 	// ---------------- 入站 ----------------
-	inbounds, err := buildInbounds(cfg)
+	inbounds, err := buildInbounds(cfg, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +137,12 @@ type Context struct {
 	ClashUI string
 	// RuleSetDir 规则集缓存目录。
 	RuleSetDir string
+	// KernelRunning 表示渲染这一刻内核正在运行(即将被停掉换成新配置)。
+	//
+	// 它只影响 53 端口 DNS 入站的取舍:内核自己在跑的时候必然占着 53,
+	// 这时候探测端口得到的 EADDRINUSE 是"自己占的",不能据此判定
+	// "端口被别的程序占了"。详见 dnsInbound 的说明。
+	KernelRunning bool
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +782,7 @@ func schemeDefaultPort(scheme string) int {
 // 入站
 // ---------------------------------------------------------------------------
 
-func buildInbounds(cfg *config.Config) ([]SBInbound, error) {
+func buildInbounds(cfg *config.Config, ctx Context) ([]SBInbound, error) {
 	var out []SBInbound
 	if cfg.Inbounds.Mixed {
 		listen := cfg.Inbounds.MixedListen
@@ -810,7 +816,7 @@ func buildInbounds(cfg *config.Config) ([]SBInbound, error) {
 		})
 	}
 	if cfg.DNS.Hijack {
-		if ib := dnsInbound(cfg.Inbounds.DNSListen, cfg.Inbounds.DNSPort); ib != nil {
+		if ib := dnsInbound(cfg.Inbounds.DNSListen, cfg.Inbounds.DNSPort, ctx.KernelRunning); ib != nil {
 			out = append(out, *ib)
 		}
 	}
@@ -859,19 +865,27 @@ func hasAddrFamily(addr []string, sep byte) bool {
 // 端口被占用(例如手工装过 dnsmasq)时返回 nil:让内核沿用现有入口,
 // 而不是绑定失败导致整个内核起不来。权限不足等其它错误多半出现在
 // 无 root 的测试环境,此时保留入站交给真实内核处理。
-func dnsInbound(enabled bool, port int) *SBInbound {
+//
+// kernelRunning 为真时跳过探测。boxd 改配置的顺序是"先渲染、再停旧内核、
+// 再起新内核",渲染这一刻旧内核还活着并占着 53,探测必然 EADDRINUSE。
+// 若据此删掉 dns-in,新内核会照常起来但没人监听 53,局域网 DNS 全部超时
+// (电脑 ERR_NAME_NOT_RESOLVED,而手机不走网关 DNS 所以看着正常)。
+// 旧内核在 Reload 里随后会被停掉、端口随之释放,所以这种情况必须生成入站。
+func dnsInbound(enabled bool, port int, kernelRunning bool) *SBInbound {
 	if !enabled {
 		return nil
 	}
 	if port <= 0 {
 		port = 53
 	}
-	if pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port)); err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return nil
+	if !kernelRunning {
+		if pc, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port)); err != nil {
+			if errors.Is(err, syscall.EADDRINUSE) {
+				return nil
+			}
+		} else {
+			pc.Close()
 		}
-	} else {
-		pc.Close()
 	}
 	return &SBInbound{
 		Type: "direct", Tag: "dns-in", Listen: "0.0.0.0", ListenPort: port,
