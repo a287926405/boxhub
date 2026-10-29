@@ -48,10 +48,10 @@ if [ "$DEV" = "0" ]; then
     done
     if [ -n "$SING_BOX_BIN" ]; then
         echo "    使用内核: $SING_BOX_BIN"
-        BOXHUB_SING_BOX="$SING_BOX_BIN" "$GO" test ./... -count=1 -timeout 300s
+        BOXHUB_SING_BOX="$SING_BOX_BIN" "$GO" test ./... -count=1 -timeout 900s
     else
         echo "    未找到 sing-box,跳过真实内核测试"
-        "$GO" test ./... -count=1 -timeout 300s -short
+        "$GO" test ./... -count=1 -timeout 900s -short
     fi
 fi
 

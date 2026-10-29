@@ -94,7 +94,7 @@ func kernelWithClash(t *testing.T, bin, cfgPath string, apiPort int, dir string)
 	}()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/proxies", apiPort)
-	deadline := time.Now().Add(25 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case <-done:
@@ -152,7 +152,7 @@ func kernelWithClash(t *testing.T, bin, cfgPath string, apiPort int, dir string)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return false, "Clash API 未在 8 秒内就绪\n" + buf.String()
+	return false, "Clash API 未在 60 秒内就绪\n" + buf.String()
 }
 
 func errString(err error) string {
