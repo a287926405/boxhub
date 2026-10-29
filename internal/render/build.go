@@ -23,6 +23,21 @@ import (
 	"boxhub/internal/config"
 )
 
+// FakeIPAnswerTTL 是 FakeIP 应答的 TTL(秒)。
+//
+// 为什么不用内核默认的 600 秒:
+//
+//	boxd 保存配置是"停内核 + 起内核"(sing-box 没有热重载),FakeIP 映射默认
+//	只存内存,重启即清空。cache_file 已开 store_fakeip 让映射跨重启保留,
+//	但只要映射还是丢了(cache.db 被删、内核被 OOM/强杀、换内核版本、改地址段),
+//	客户端缓存里的假地址就会全部变成黑洞,内核日志刷 "missing fakeip record"。
+//	TTL 600 秒意味着客户端要卡十分钟才肯重新解析——这正是"电脑断网十几分钟、
+//	手机没事"的来源(Windows DNS 缓存严格按 TTL 存,手机缓存短)。
+//
+// 压到 60 秒后,即使映射全丢,最坏一分钟客户端就会重新解析拿到新映射,
+// 把"十分钟级故障"降成"一分钟级抖动"。
+const FakeIPAnswerTTL = 60
+
 // Build 生成 sing-box 配置对象(未序列化,便于在测试里断言)。
 func Build(cfg *config.Config, ctx Context) (*SBConfig, error) {
 	r := config.NewResolver(cfg)
@@ -670,7 +685,12 @@ func buildDNS(cfg *config.Config, r *config.Resolver, tg tags) (*SBDNS, error) {
 			// 默认直连:其余设备 A/AAAA 全部真实直连解析
 			rules = append(rules, SBDNSRule{QueryType: []string{"A", "AAAA"}, Server: directTag})
 		} else {
-			rules = append(rules, SBDNSRule{QueryType: []string{"A", "AAAA"}, Server: "dns-fakeip"})
+			rules = append(rules, SBDNSRule{
+				QueryType: []string{"A", "AAAA"},
+				Server:    "dns-fakeip",
+				// 兜底 TTL:见 FakeIPAnswerTTL 的说明。
+				RewriteTTL: FakeIPAnswerTTL,
+			})
 		}
 		out.Rules = rules
 	}
