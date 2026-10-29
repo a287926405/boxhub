@@ -301,6 +301,20 @@ func ValidateAll(cfg *Config) []RefError {
 		}
 	}
 
+	// ---- 设备分流模式(流量走向) ----
+	switch cfg.Routing.Mode {
+	case "", RouteModeProxy, RouteModeDirect:
+	default:
+		errs = append(errs, RefError{"设备分流模式", fmt.Sprintf("未知模式 %q(应为 proxy 或 direct)", cfg.Routing.Mode)})
+	}
+	for _, ip := range cfg.Routing.ModeExceptions {
+		if net.ParseIP(ip) == nil {
+			if _, _, err := net.ParseCIDR(ip); err != nil {
+				errs = append(errs, RefError{"设备分流模式", fmt.Sprintf("例外设备地址无效: %q(需 IP 或 CIDR)", ip)})
+			}
+		}
+	}
+
 	// ---- 筛选 ----
 	for i := range cfg.Filters {
 		f := &cfg.Filters[i]

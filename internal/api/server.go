@@ -1346,6 +1346,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Panel    *config.PanelSettings   `json:"panel"`
 		DNS      *config.DNSSettings     `json:"dns"`
+		Routing  *config.RoutingSettings `json:"routing"`
 		Inbounds *config.InboundSettings `json:"inbounds"`
 	}
 	if !readJSON(w, r, &req) {
@@ -1390,6 +1391,14 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			// 例外设备允许清空,所以无条件覆盖
 			cfg.DNS.ModeExceptions = d.ModeExceptions
+		}
+		// 设备分流模式:流量层面走不走代理。
+		// 例外设备允许清空(用户可能把最后一个例外删掉),所以无条件覆盖。
+		if req.Routing != nil {
+			if req.Routing.Mode != "" {
+				cfg.Routing.Mode = req.Routing.Mode
+			}
+			cfg.Routing.ModeExceptions = req.Routing.ModeExceptions
 		}
 		if req.Inbounds != nil {
 			ib := req.Inbounds

@@ -971,6 +971,11 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 		IPIsPrivate: true, Action: "route", Outbound: "direct",
 	})
 
+	// 设备分流模式:按来源设备决定流量走不走代理(与 DNS 分流模式无关)。
+	// 必须排在业务分流规则之前 —— 例外设备是硬覆盖,不该再被后面的
+	// 域名/规则集规则改判,否则"设成直连的设备访问 youtube"还是会被拽进代理。
+	applyDeviceRouting(rt, cfg, r)
+
 	// 屏蔽 QUIC:走代理的 UDP 443 直接拒绝,浏览器自动退回 TCP
 	if cfg.Inbounds.BlockQUIC {
 		rt.Rules = append(rt.Rules, SBRule{
@@ -1179,6 +1184,53 @@ func DefaultProxyTarget(cfg *config.Config, r *config.Resolver) string {
 //  3. 第一个启用的非动态节点组
 //  4. 第一个启用的节点
 //  5. direct
+// applyDeviceRouting 按「设备分流模式」改写最终出口与来源 IP 规则。
+//
+// 语义:
+//   - 默认代理:所有设备走代理;ModeExceptions 里的设备走直连。
+//   - 默认直连:所有设备走直连;ModeExceptions 里的设备走代理。
+//
+// 直连模式下"其余设备走直连"用 invert 表达:sing-box 没有"来源不在列表里"
+// 的直接写法,但可以对整条规则取反,效果就是"除例外设备以外的所有来源"。
+// 不这么做的话,后面按域名匹配的分流规则会把它们重新送进代理。
+func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) {
+	ex := normalizeSourceCIDRs(cfg.Routing.ModeExceptions)
+	if cfg.Routing.Mode == config.RouteModeDirect {
+		rt.Final = "direct"
+		if len(ex) == 0 {
+			return
+		}
+		rt.Rules = append(rt.Rules, SBRule{
+			ClientIP: ex, Action: "route", Outbound: defaultProxyTarget(cfg, r),
+		})
+		rt.Rules = append(rt.Rules, SBRule{
+			ClientIP: ex, Invert: true, Action: "route", Outbound: "direct",
+		})
+		return
+	}
+	if len(ex) == 0 {
+		return
+	}
+	rt.Rules = append(rt.Rules, SBRule{
+		ClientIP: ex, Action: "route", Outbound: "direct",
+	})
+}
+
+// normalizeSourceCIDRs 去空白、去重,并丢弃空行。
+func normalizeSourceCIDRs(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 func defaultProxyTarget(cfg *config.Config, r *config.Resolver) string {
 	// 1. 有 Proxy 总出口组时兜底走它(与 SMBox 一致)。
 	//    这是最符合直觉的:用户在"Proxy"里选什么,兜底就是什么。

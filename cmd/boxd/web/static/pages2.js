@@ -100,6 +100,8 @@ async function renderRules(root) {
     ? emptyState('⇉', '还没有规则', '', h('button', { class: 'primary sm', onclick: () => editRule(null) }, '新建规则'))
     : (rulesViewMode === 'card' ? rulesCardsView(policies) : rulesTableView(policies));
 
+  // 设备分流模式放在规则列表上方:它决定"流量走不走代理",是规则生效前的总开关。
+  root.append(deviceModeCard(cfg));
   root.append(card('', `共 ${policies.length} 条规则;从上往下匹配,先命中的生效。`, '⇉', 'i-blue', body));
 }
 

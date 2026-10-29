@@ -559,8 +559,8 @@ function dnsModeCard(cfg) {
   }, '×'));
   const currentMode = () => (radioProxy.checked ? 'proxy' : 'direct');
   const modeText = () => (currentMode() === 'direct'
-    ? '全部设备走直连 DNS 解析，例外设备走 Sing-Box DNS'
-    : '全部设备走 Sing-Box DNS 解析（FakeIP/代理 DNS），例外设备走直连 DNS');
+    ? '全部设备用直连 DNS（拿到真实 IP，境外域名可能被污染）；例外设备走内核解析'
+    : '全部设备走内核解析（境外域名用假地址，避免污染）；例外设备用直连 DNS');
 
   const desc = h('div', { class: 'small dim', style: { marginBottom: '12px' } }, modeText());
   const switchMode = async () => {
@@ -574,7 +574,7 @@ function dnsModeCard(cfg) {
     h('div', { class: 'card-head' },
       h('div', { class: 'ico i-orange' }, '⇄'),
       h('div', {}, h('div', { class: 'card-title' }, 'DNS 分流模式'),
-        h('div', { class: 'card-sub' }, '按来源设备决定域名解析走不走内核')),
+        h('div', { class: 'card-sub' }, '只影响域名怎么解析，不影响流量走不走代理')),
       h('div', { class: 'spacer' }),
       h('button', {
         class: 'sm', onclick: () => editDnsExceptions(exceptions),
@@ -621,6 +621,93 @@ function editDnsExceptions(exceptions) {
     ta, msg), async () => {
     const list = ta.value.split('\n').map((x) => x.trim()).filter(Boolean);
     await saveDnsMode(((state.config || {}).dns || {}).mode || 'proxy', list);
+    closeModal();
+  });
+}
+
+// ===========================================================================
+// 设备分流模式(流量层面):按来源设备决定流量走不走代理。
+//
+// 与上面的「DNS 分流模式」是两件事:那张卡只决定域名怎么解析,
+// 这张卡才决定流量到底进不进代理。两者互不影响,可以自由组合。
+// ===========================================================================
+function deviceModeCard(cfg) {
+  const routing = (cfg && cfg.routing) || {};
+  const mode = routing.mode || 'proxy';
+  const exceptions = routing.mode_exceptions || [];
+  const radioProxy = h('input', { type: 'radio', name: 'device-mode', value: 'proxy', checked: mode === 'proxy' });
+  const radioDirect = h('input', { type: 'radio', name: 'device-mode', value: 'direct', checked: mode === 'direct' });
+  const currentMode = () => (radioProxy.checked ? 'proxy' : 'direct');
+
+  const modeText = () => (currentMode() === 'direct'
+    ? '全部设备走直连，例外设备走代理'
+    : '全部设备走代理，例外设备走直连');
+  const desc = h('div', { class: 'small dim', style: { marginBottom: '12px' } }, modeText());
+
+  const chip = (ip) => h('span', {
+    class: 'badge', style: { display: 'inline-flex', gap: '6px', alignItems: 'center' },
+  }, ip, h('a', {
+    href: 'javascript:void(0)', title: '移除', style: { color: 'var(--text-mute)' },
+    onclick: async (e) => {
+      e.stopPropagation();
+      await saveDeviceMode(currentMode(), exceptions.filter((x) => x !== ip));
+    },
+  }, '×'));
+
+  const switchMode = async () => {
+    desc.textContent = modeText();
+    await saveDeviceMode(currentMode(), exceptions);
+  };
+  radioProxy.addEventListener('change', switchMode);
+  radioDirect.addEventListener('change', switchMode);
+
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-head' },
+      h('div', { class: 'ico i-orange' }, '⇄'),
+      h('div', {}, h('div', { class: 'card-title' }, '设备分流模式'),
+        h('div', { class: 'card-sub' }, '按来源设备决定流量走不走代理')),
+      h('div', { class: 'spacer' }),
+      h('button', {
+        class: 'sm', onclick: () => editDeviceExceptions(exceptions),
+      }, '编辑')),
+    desc,
+    h('div', { class: 'row', style: { marginBottom: '12px', gap: '18px' } },
+      h('label', { style: { display: 'flex', gap: '7px', alignItems: 'center', cursor: 'pointer' } }, radioProxy, '默认代理'),
+      h('label', { style: { display: 'flex', gap: '7px', alignItems: 'center', cursor: 'pointer' } }, radioDirect, '默认直连')),
+    h('div', { class: 'row' },
+      h('span', { class: 'small dim' }, '例外设备',
+        exceptions.length ? h('span', { class: 'badge info', style: { marginLeft: '6px' } }, String(exceptions.length)) : null),
+      ...exceptions.map(chip),
+      exceptions.length === 0 ? h('span', { class: 'small mute' }, '（无）') : null));
+}
+
+async function saveDeviceMode(mode, exceptions) {
+  try {
+    // 后端对 mode_exceptions 是覆盖语义,两个字段必须一起传,
+    // 否则"只改模式"会把例外设备清空。
+    await api('PUT', '/api/settings', { routing: { mode, mode_exceptions: exceptions } });
+    toast('设备分流模式已保存', 'ok');
+    state.config = (await api('GET', '/api/config')).config;
+    renderPage();
+  } catch (e) {
+    toast(e.message, 'err', 8000);
+    renderPage(); // 回滚界面显示
+  }
+}
+
+function editDeviceExceptions(exceptions) {
+  const ta = h('textarea', {
+    placeholder: '每行一个设备 IP,例如:\n10.10.10.35\n10.10.10.42\n192.168.1.0/24',
+    style: { height: '140px' },
+  }, exceptions.join('\n'));
+  openModal('例外设备', h('div', {},
+    h('div', { class: 'small dim', style: { marginBottom: '10px' } },
+      '这些设备的流量走与「默认」相反的路径(支持 IP 或 CIDR)。' +
+      '按连接来源 IP 生效,透明代理与端口代理都适用。'),
+    ta), async () => {
+    const list = ta.value.split('\n').map((x) => x.trim()).filter(Boolean);
+    const cur = ((state.config || {}).routing || {}).mode || 'proxy';
+    await saveDeviceMode(cur, list);
     closeModal();
   });
 }

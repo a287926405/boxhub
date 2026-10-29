@@ -32,6 +32,9 @@ type Config struct {
 	Panel PanelSettings `json:"panel"`
 	// DNS 域名解析设置。
 	DNS DNSSettings `json:"dns"`
+	// Routing 设备分流模式:按来源设备决定流量走不走代理。
+	// 与 DNS.Mode 是两件事 —— 那个只管域名解析方式,这个才管流量走向。
+	Routing RoutingSettings `json:"routing"`
 	// Inbounds 入站(本地代理端口、透明代理等)。
 	Inbounds InboundSettings `json:"inbounds"`
 
@@ -60,6 +63,7 @@ func NewDefault() *Config {
 			Theme:    "auto",
 		},
 		DNS: DefaultDNS(),
+		Routing: DefaultRouting(),
 		Inbounds: InboundSettings{
 			Mixed: true,
 			MixedListen: "0.0.0.0",
@@ -121,6 +125,31 @@ const (
 	DNSModeProxy  = "proxy"
 	DNSModeDirect = "direct"
 )
+
+// RoutingSettings 设备分流模式:按来源设备决定流量走不走代理。
+//
+// 这是「流量层面」的分流,和 DNSSettings.Mode(只决定域名怎么解析)完全不同:
+//   - 默认代理:所有设备的流量走代理,ModeExceptions 里的设备走直连;
+//   - 默认直连:所有设备的流量走直连,ModeExceptions 里的设备走代理。
+//
+// 判定依据是连接的来源 IP(source_ip_cidr),透明代理与端口代理都适用。
+type RoutingSettings struct {
+	// Mode 取值 RouteModeProxy / RouteModeDirect,空等同于 proxy。
+	Mode string `json:"mode,omitempty"`
+	// ModeExceptions 例外设备(来源 IP / CIDR 列表)。
+	ModeExceptions []string `json:"mode_exceptions,omitempty"`
+}
+
+// RouteMode 取值。
+const (
+	RouteModeProxy  = "proxy"
+	RouteModeDirect = "direct"
+)
+
+func DefaultRouting() RoutingSettings {
+	// 默认代理:与历史行为一致(route.final 一直是 Proxy),老配置升级后行为不变。
+	return RoutingSettings{Mode: RouteModeProxy}
+}
 
 func DefaultDNS() DNSSettings {
 	return DNSSettings{
