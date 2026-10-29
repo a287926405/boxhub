@@ -770,7 +770,11 @@ func buildInbounds(cfg *config.Config) ([]SBInbound, error) {
 		}
 		addr := cfg.Inbounds.TunAddress
 		if len(addr) == 0 {
-			addr = []string{"172.19.0.1/30"}
+			addr = defaultTunAddress
+		} else if !hasAddrFamily(addr, ':') {
+			// 用户自定义地址时补上 ULA v6:只有 IPv4 会让 strict_route
+			// 注入 `ip -6 rule unreachable` 黑洞,v6 节点直接拨不出去
+			addr = append(append([]string{}, addr...), defaultTunAddress[1])
 		}
 		out = append(out, SBInbound{
 			Type: "tun", Tag: "tun-in", Address: addr,
@@ -795,6 +799,33 @@ func buildInbounds(cfg *config.Config) ([]SBInbound, error) {
 		generatedInboundTags = append(generatedInboundTags, ib.Tag)
 	}
 	return out, nil
+}
+
+// defaultTunAddress 是 TUN 入站的默认地址段。
+//
+// 必须同时带 IPv6(ULA,fd00::/8 本地段,不会与公网冲突):
+// strict_route 开启后,sing-box 发现 tun 没有 v6 地址会在
+// `ip -6 rule` 里注入一条 `from all unreachable` 黑洞,
+// 把包括**拨号 IPv6 节点本身**在内的所有 v6 出站全部丢掉,
+// 表现为「IPv6 节点全部 network is unreachable」。
+var defaultTunAddress = []string{"172.19.0.1/30", "fd12:3456:789a::1/64"}
+
+// hasAddrFamily 判断地址列表里是否已含指定族(v4 用 '.',v6 用 ':')。
+// IPv6 的 CIDR 前缀也写成 /64,所以用地址体里是否含冒号区分。
+func hasAddrFamily(addr []string, sep byte) bool {
+	for _, a := range addr {
+		body := a
+		if i := strings.IndexByte(a, '/'); i >= 0 {
+			body = a[:i]
+		}
+		if sep == ':' && strings.ContainsRune(body, ':') {
+			return true
+		}
+		if sep == '.' && strings.ContainsRune(body, '.') && !strings.ContainsRune(body, ':') {
+			return true
+		}
+	}
+	return false
 }
 
 // dnsInbound 构造 53 端口的 DNS 入站(direct inbound,查询交给 hijack-dns)。
