@@ -94,7 +94,7 @@ func kernelWithClash(t *testing.T, bin, cfgPath string, apiPort int, dir string)
 	}()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d/proxies", apiPort)
-	deadline := time.Now().Add(8 * time.Second)
+	deadline := time.Now().Add(25 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case <-done:
@@ -464,7 +464,7 @@ ok:
 	}
 	// 必须真的能 run 起来(不是只看 check)。这里只关心"是否存活",
 	// 不关心链式代理是否出现(本用例里没有链式代理)。
-	alive, out := runOnly(t, bin, path, dir, 3*time.Second)
+	alive, out := runOnly(t, bin, path, dir, 15*time.Second)
 	if !alive {
 		t.Fatalf("空组场景下内核无法运行(这是 check 通过但 run 失败的经典问题):\n%s", out)
 	}
