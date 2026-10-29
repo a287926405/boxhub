@@ -268,6 +268,12 @@ type SBCacheFile struct {
 	Enabled   bool   `json:"enabled"`
 	Path      string `json:"path,omitempty"`
 	StoreRDRC bool   `json:"store_rdrc,omitempty"`
+	// StoreFakeIP 持久化 FakeIP 映射。
+	// 必须开启:boxd 改配置是"停内核 + 起内核"(sing-box 没有热重载),
+	// 映射只存内存时,重启后客户端缓存里的假地址全部失效,
+	// 内核日志刷 "missing fakeip record",这些目标再落进私网直连规则
+	// 就是连不通的黑洞。Windows 的 DNS 缓存有 10 分钟,表现尤其明显。
+	StoreFakeIP bool `json:"store_fakeip,omitempty"`
 }
 
 type SBClashAPI struct {

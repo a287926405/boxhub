@@ -101,7 +101,12 @@ func Build(cfg *config.Config, ctx Context) (*SBConfig, error) {
 		}
 	}
 	if ctx.CacheFile != "" {
-		exp.CacheFile = &SBCacheFile{Enabled: true, Path: ctx.CacheFile, StoreRDRC: true}
+		// StoreFakeIP:改配置会重启内核,FakeIP 映射必须跨重启保留,
+		// 否则客户端缓存里的假地址全部变成黑洞(电脑端症状最重)。
+		exp.CacheFile = &SBCacheFile{
+			Enabled: true, Path: ctx.CacheFile,
+			StoreRDRC: true, StoreFakeIP: true,
+		}
 	}
 	if exp.ClashAPI != nil || exp.CacheFile != nil {
 		out.Experimental = exp
