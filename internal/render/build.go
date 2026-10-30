@@ -12,6 +12,7 @@
 package render
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -951,11 +952,9 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 		rsByTag[tag] = SBRuleSet{
 			Tag: tag, Type: "remote", Format: fmtType, URL: url,
 			UpdateInterval: "24h",
-			// 规则集必须直连下载:走代理会让"内核启动依赖代理可用"成为循环,
-			// 而且路由规则还没生效时内核并不知道该用哪个出口(1.14 会警告用默认出口)。
 			// 1.14 里该字段在 rule_set 上叫 download_detour(旧的 route 级写法已弃用);
 			// 注意 HTTPClient 与 DownloadDetour 互斥,不能同时出现。
-			DownloadDetour: "direct",
+			DownloadDetour: downloadDetour(cfg, r),
 		}
 		return tag
 	}
@@ -1328,8 +1327,38 @@ func inboundTags(cfg *config.Config) []string {
 // Build 串行执行(入站先于路由),包级快照与 generatedOutbounds 同一模式。
 var generatedInboundTags []string
 
-// ruleSetTag 生成稳定、合法的规则集 tag(长度受限,只保留安全字符)。
+// downloadDetour 决定规则集下载走哪个出口。
+//
+// 原实现固定直连。但国内网络直连 github.com 基本不通(实测 8 秒超时),
+// 只要有一个规则集没被 cache.db 缓存过,sing-box 启动时就会 FATAL
+// (start router: initialize rule-set ... i/o timeout),内核直接起不来 ——
+// 表现为整机断网,而且从面板上看只是"服务 active 但内核没跑"。
+//
+// 有代理出口时改走代理:出站与 DNS 都在规则集之前初始化,不会形成循环依赖。
+// 没有可用代理(纯直连部署)时保持直连,行为与以前一致。
+func downloadDetour(cfg *config.Config, r *config.Resolver) string {
+	t := defaultProxyTarget(cfg, r)
+	if t != "" && t != "direct" && outboundExists(t) {
+		return t
+	}
+	return "direct"
+}
+
+// ruleSetTag 生成稳定、唯一、合法的规则集 tag。
+//
+// 唯一性是硬要求:tag 是规则引用规则集的唯一凭据。只截取 URL 前缀会撞车——
+// MetaCubeX 的规则集全部共享
+// https://github.com/MetaCubeX/meta-rules-dat/raw/refs/heads/sing/geo/ 前缀,
+// 截断后 instagram.srs / youtube.srs / geolocation-!cn.srs 会得到同一个 tag,
+// 于是所有规则都指向最先出现的那一个(实测指向 apple@cn.json),
+// 表现为"INS 规则明明配了 instagram,流量却走了兜底 Proxy"。
+//
+// 所以:可读前缀(便于排障) + URL 的 SHA-256 前 4 字节,保证不同 URL 不撞车。
 func ruleSetTag(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
 	var b strings.Builder
 	for _, c := range raw {
 		switch {
@@ -1340,10 +1369,11 @@ func ruleSetTag(raw string) string {
 		}
 	}
 	s := b.String()
-	if len(s) > 40 {
-		s = s[:40]
+	if len(s) > 32 {
+		s = s[:32]
 	}
-	return s
+	sum := sha256.Sum256([]byte(raw))
+	return fmt.Sprintf("%s-%x", s, sum[:4])
 }
 
 // normalizeRuleSetURL 把三种写法统一成可下载地址:
