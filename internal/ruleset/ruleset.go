@@ -43,6 +43,34 @@ const concurrency = 4
 // maxRuleSetSize 单个规则集文件上限,防止把磁盘写满。
 const maxRuleSetSize = 64 << 20
 
+// DefaultMirrors GitHub 直连失败时按序尝试的镜像前缀(gh-proxy 形态:
+// 前缀 + 完整 URL)。公共镜像存活变动频繁,实测(2026-10):
+//   - gh-proxy.com   可用,支持 raw / releases 大文件 / api.github.com
+//   - gh-proxy.net   可用(302 跳转)
+//   - gh.ddlc.top    可用但有速率限制
+//
+// 环境变量 BOXHUB_GH_MIRROR(逗号/空格分隔)可整体覆盖或前置。
+var DefaultMirrors = []string{
+	"https://gh-proxy.com",
+	"https://gh-proxy.net",
+	"https://gh.ddlc.top",
+}
+
+// MirrorCandidates 返回一个 URL 的下载候选:原始地址在前(缓存键不变),
+// 之后依次是各镜像前缀拼出的地址。
+func MirrorCandidates(rawURL string, mirrors []string) []string {
+	out := make([]string, 0, 1+len(mirrors))
+	out = append(out, rawURL)
+	for _, m := range mirrors {
+		m = strings.TrimRight(strings.TrimSpace(m), "/")
+		if m == "" || !strings.HasPrefix(m, "http") {
+			continue
+		}
+		out = append(out, m+"/"+rawURL)
+	}
+	return out
+}
+
 // FileName 返回某个 URL 对应的本地文件名。
 //
 // 用 URL 的哈希而不是可读名:不同规则集可能同名(instagram.srs / geosite/instagram.srs),
@@ -169,8 +197,10 @@ type Result struct {
 // Ensure 并发下载缺失/过期的规则集。
 //
 // proxyURL 形如 "http://127.0.0.1:7890";为空表示直连。
+// mirrors 是镜像前缀候选:直连失败时自动换镜像重试(国内直连 GitHub
+// 不通是常态,镜像前缀 + 完整 URL 是目前最稳的路子)。
 // 任何单个失败都只记录,不返回错误 —— 调用方按"本地有就用、没有就退回远程"处理。
-func Ensure(ctx context.Context, dir string, refs []Ref, proxyURL string) Result {
+func Ensure(ctx context.Context, dir string, refs []Ref, proxyURL string, mirrors []string) Result {
 	var res Result
 	if dir == "" || len(refs) == 0 {
 		return res
@@ -213,7 +243,7 @@ func Ensure(ctx context.Context, dir string, refs []Ref, proxyURL string) Result
 			case <-ctx.Done():
 				return
 			}
-			if err := fetchOne(ctx, client, dir, r); err != nil {
+			if err := fetchOne(ctx, client, dir, r, mirrors); err != nil {
 				mu.Lock()
 				res.Failed++
 				if len(res.Errors) < 5 {
@@ -245,8 +275,33 @@ func newClient(proxyURL string) *http.Client {
 }
 
 // fetchOne 下载到临时文件再改名,避免下到一半的内核读到半截文件。
-func fetchOne(ctx context.Context, client *http.Client, dir string, r Ref) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL, nil)
+// 直连失败(超时/404/HTML)自动依次尝试镜像候选,缓存文件名始终以原始
+// URL 为键,镜像只影响传输路径。
+func fetchOne(ctx context.Context, client *http.Client, dir string, r Ref, mirrors []string) error {
+	var errs []string
+	for _, u := range MirrorCandidates(r.URL, mirrors) {
+		err := fetchFrom(ctx, client, dir, r, u)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		errs = append(errs, u+": "+err.Error())
+	}
+	if len(errs) == 0 {
+		return errors.New("没有可用的下载候选")
+	}
+	// 只保留最后一条完整错误 + 候选数量,别把面板刷爆
+	last := errs[len(errs)-1]
+	if i := strings.Index(last, " "); i > 0 {
+		last = last[i+1:]
+	}
+	return fmt.Errorf("%w(已尝试 %d 个源)", errors.New(last), len(errs))
+}
+
+func fetchFrom(ctx context.Context, client *http.Client, dir string, r Ref, url string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}

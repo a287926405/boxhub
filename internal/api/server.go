@@ -456,6 +456,28 @@ func (s *Server) build(cfg *config.Config) (*render.SBConfig, error) {
 	return render.Build(cfg, ctx)
 }
 
+// ghMirrors 返回 GitHub 下载候选镜像前缀:环境变量 BOXHUB_GH_MIRROR
+// (逗号/空格分隔)优先,其后是内置默认列表。
+func (s *Server) ghMirrors() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(list []string) {
+		for _, m := range list {
+			m = strings.TrimRight(strings.TrimSpace(m), "/")
+			if m == "" || seen[m] {
+				continue
+			}
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	if env := os.Getenv("BOXHUB_GH_MIRROR"); env != "" {
+		add(strings.FieldsFunc(env, func(r rune) bool { return r == ',' || r == ' ' || r == ';' }))
+	}
+	add(ruleset.DefaultMirrors)
+	return out
+}
+
 // preflightRuleSets 在保存配置、切换内核之前,把本次渲染仍为 remote 的
 // 规则集同步下载并校验一遍。
 //
@@ -483,7 +505,7 @@ func (s *Server) preflightRuleSets(sb *render.SBConfig) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel()
-	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy)
+	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy, s.ghMirrors())
 
 	var missing []string
 	for _, ref := range refs {
@@ -535,7 +557,7 @@ func (s *Server) prefetchRuleSets() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy)
+	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy, s.ghMirrors())
 	if res.Downloaded > 0 || res.Failed > 0 {
 		fmt.Printf("[规则集] 预取完成:成功 %d,失败 %d %s\n", res.Downloaded, res.Failed, strings.Join(res.Errors, "; "))
 	}
@@ -564,6 +586,16 @@ func (s *Server) ApplyStartup() error {
 	sb, err := s.build(cfg)
 	if err != nil {
 		return err
+	}
+	// 启动前先把规则集落地成本地文件(直连失败自动换镜像,见 ruleset 包)。
+	// 国内直连 GitHub 不通的机器上,不预取的话内核启动会卡在下载规则集上
+	// 直到 FATAL —— 而此时面板还没起来,用户连改配置的机会都没有。
+	// 预取失败不阻塞启动:退回原来的行为,让内核自己尝试下载。
+	if err := s.preflightRuleSets(sb); err != nil {
+		fmt.Printf("[规则集] 启动预取未完成(不阻塞启动): %v\n", err)
+	} else if sb2, err2 := s.build(cfg); err2 == nil {
+		// 预取成功,重新渲染把命中的规则集改成 type:local
+		sb = sb2
 	}
 	raw, err := sb.Marshal()
 	if err != nil {

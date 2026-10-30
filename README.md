@@ -51,8 +51,9 @@ curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh |
 # 指定监听端口(默认就是 80;想换别的端口才需要写)
 BOXHUB_PORT=8080 curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
 
-# 国内直连 GitHub 不通:走 gh-proxy 类镜像
-BOXHUB_GH_MIRROR=https://gh-proxy.com curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
+# 国内网络(直连 GitHub 不通):整条命令都走镜像 —— 注意 curl 的脚本地址也换了前缀
+BOXHUB_GH_MIRROR=https://gh-proxy.com curl -fsSL \
+  https://gh-proxy.com/https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash
 
 # 已装机器升级(保留配置与现有端口)
 curl -fsSL https://raw.githubusercontent.com/a287926405/boxhub/main/install.sh | bash -s -- upgrade
@@ -69,6 +70,19 @@ tar -xzf boxhub-*.tar.gz && cd boxhub-*
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 sudo BOXHUB_LOCAL_BOXD=bin/boxd-linux-$ARCH BOXHUB_LOCAL_SINGBOX=/path/to/sing-box bash manage.sh install
 ```
+
+### 只有国内网络怎么装
+
+安装链路上的每一层(安装脚本、BoxHub 面板、sing-box 内核、zashboard 面板资源、
+运行时的规则集)默认都在 GitHub 上。从 v1.15.4 起,所有下载点都带**多源自动回退**:
+
+- 未指定镜像时,脚本先探测直连 GitHub(5 秒出结果);
+- 直连不通就自动换内置镜像(`gh-proxy.com` / `gh-proxy.net` / `gh.ddlc.top`,逐个尝试);
+- 运行期的规则集下载、面板里的内核升级走同一条候选链,可用环境变量
+  `BOXHUB_GH_MIRROR`(支持逗号分隔多个)把自建镜像放到最前。
+
+只要机器能访问其中任意一个源,一键安装就能跑通。若连镜像都不通(纯离线),
+用下面的离线安装;装好后的 BoxHub 内核启动不依赖网络(规则集全部本地化)。
 
 ### 指定端口
 

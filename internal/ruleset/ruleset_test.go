@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,7 +78,7 @@ func TestEnsureDownloadsAndCaches(t *testing.T) {
 		{URL: srv.URL + "/b.srs", Format: "binary"},
 		{URL: srv.URL + "/a.srs", Format: "binary"}, // 重复项要去重
 	}
-	res := Ensure(context.Background(), dir, refs, "")
+	res := Ensure(context.Background(), dir, refs, "", nil)
 	if res.Failed != 0 {
 		t.Fatalf("下载失败: %v", res.Errors)
 	}
@@ -99,7 +100,7 @@ func TestEnsureDownloadsAndCaches(t *testing.T) {
 	}
 
 	// 再跑一次不应重复下载
-	res2 := Ensure(context.Background(), dir, refs, "")
+	res2 := Ensure(context.Background(), dir, refs, "", nil)
 	if res2.Downloaded != 0 {
 		t.Fatalf("缓存有效时不该重复下载,实际 %d", res2.Downloaded)
 	}
@@ -112,7 +113,7 @@ func TestEnsureHandlesHTTPError(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	res := Ensure(context.Background(), dir, []Ref{{URL: srv.URL + "/x.srs", Format: "binary"}}, "")
+	res := Ensure(context.Background(), dir, []Ref{{URL: srv.URL + "/x.srs", Format: "binary"}}, "", nil)
 	if res.Failed != 1 {
 		t.Fatalf("404 应记为失败,实际 Failed=%d", res.Failed)
 	}
@@ -126,7 +127,7 @@ func TestEnsureHandlesHTTPError(t *testing.T) {
 
 // 目录为空时直接返回,不 panic。
 func TestEnsureNoopWithoutDir(t *testing.T) {
-	res := Ensure(context.Background(), "", []Ref{{URL: "https://example.com/a.srs"}}, "")
+	res := Ensure(context.Background(), "", []Ref{{URL: "https://example.com/a.srs"}}, "", nil)
 	if res.Downloaded != 0 || res.Failed != 0 {
 		t.Fatal("没有目录时应当什么都不做")
 	}
@@ -142,7 +143,7 @@ func TestEnsureRejectsHTML(t *testing.T) {
 
 	dir := t.TempDir()
 	u := srv.URL + "/cloudflare.srs"
-	res := Ensure(context.Background(), dir, []Ref{{URL: u, Format: "binary"}}, "")
+	res := Ensure(context.Background(), dir, []Ref{{URL: u, Format: "binary"}}, "", nil)
 	if res.Failed != 1 {
 		t.Fatalf("HTML 应记为失败,实际 Failed=%d", res.Failed)
 	}
@@ -183,5 +184,53 @@ func TestValidateFileSource(t *testing.T) {
 	}
 	if err := ValidateFile(bad, "source"); err == nil {
 		t.Fatal("HTML 伪装成 JSON 应报错")
+	}
+}
+
+// 直连失败(404)时必须自动换镜像重试,且缓存键仍是原始 URL。
+func TestEnsureFallsBackToMirror(t *testing.T) {
+	direct := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "blocked", http.StatusNotFound)
+	}))
+	defer direct.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// gh-proxy 形态:路径里带完整原始 URL
+		if !strings.Contains(r.URL.RequestURI(), "github.com") {
+			t.Errorf("镜像收到的不是前缀拼接地址: %s", r.URL.RequestURI())
+		}
+		w.Write([]byte("SRS\x02via-mirror"))
+	}))
+	defer mirror.Close()
+
+	dir := t.TempDir()
+	raw := direct.URL + "/github.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs"
+	res := Ensure(context.Background(), dir, []Ref{{URL: raw, Format: "binary"}}, "", []string{mirror.URL})
+	if res.Downloaded != 1 || res.Failed != 0 {
+		t.Fatalf("镜像回退应成功,实际 %+v %v", res, res.Errors)
+	}
+	p := LocalPath(dir, raw, "binary")
+	if p == "" {
+		t.Fatal("缓存键必须是原始 URL,而不是镜像地址")
+	}
+	b, _ := os.ReadFile(p)
+	if string(b) != "SRS\x02via-mirror" {
+		t.Fatalf("内容不对: %q", b)
+	}
+}
+
+func TestMirrorCandidates(t *testing.T) {
+	got := MirrorCandidates("https://github.com/a/b.srs", []string{" https://m1.example ", "", "not-http", "https://m2.example/"})
+	want := []string{
+		"https://github.com/a/b.srs",
+		"https://m1.example/https://github.com/a/b.srs",
+		"https://m2.example/https://github.com/a/b.srs",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("候选数不对: %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("候选[%d] = %s, want %s", i, got[i], want[i])
+		}
 	}
 }

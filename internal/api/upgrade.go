@@ -14,6 +14,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+
+	"boxhub/internal/ruleset"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,9 +32,9 @@ import (
 )
 
 const (
-	singboxRepo    = "SagerNet/sing-box"
-	downloadLimit  = 160 << 20 // 160MB 上限,防异常大文件
-	checkCacheTTL  = 10 * time.Minute
+	singboxRepo   = "SagerNet/sing-box"
+	downloadLimit = 160 << 20 // 160MB 上限,防异常大文件
+	checkCacheTTL = 10 * time.Minute
 )
 
 // upgProg 下载进度(供前端轮询显示"已下多少/共多少",
@@ -65,8 +68,8 @@ func (u *upgProg) snapshot() (string, int64, int64, time.Time) {
 }
 
 var (
-	upgradeMu   sync.Mutex // 同一时间只允许一次升级
-	checkCache  struct {
+	upgradeMu  sync.Mutex // 同一时间只允许一次升级
+	checkCache struct {
 		sync.Mutex
 		at   time.Time
 		data map[string]any
@@ -85,6 +88,37 @@ func ghAssetURL(mirror, tag, file string) string {
 		}
 	}
 	return base
+}
+
+// ghURLCandidates 返回一个 GitHub 地址的下载候选:显式指定的 mirror 最优先,
+// 其次直连(境外机器一次命中),最后内置镜像(国内直连不通的兜底)。
+// mirror 传 "" 表示用户没有指定,直接从直连开始。
+func ghURLCandidates(mirror, rawURL string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		p = strings.TrimRight(strings.TrimSpace(p), "/")
+		if p != "" && !strings.HasPrefix(p, "http") {
+			return
+		}
+		u := rawURL
+		if p != "" {
+			u = p + "/" + rawURL
+		}
+		if seen[u] {
+			return
+		}
+		seen[u] = true
+		out = append(out, u)
+	}
+	if m := strings.TrimSpace(mirror); m != "" {
+		add(m)
+	}
+	add("")
+	for _, m := range ruleset.DefaultMirrors {
+		add(m)
+	}
+	return out
 }
 
 // verCmp 比较 x.y.z;返回 -1/0/1。解析失败按相等处理(不误报可升级)。
@@ -142,32 +176,43 @@ func (s *Server) handleKernelUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	checkCache.Unlock()
 
+	// gh-proxy 类镜像也能代理 api.github.com(实测);候选链:
+	// 用户镜像 → 直连 → 内置镜像,任一拿到结果即止。
 	apiURL := "https://api.github.com/repos/" + singboxRepo + "/releases/latest"
-	if m := strings.Trim(strings.TrimSpace(mirror), "/"); m != "" && strings.HasPrefix(m, "http") {
-		// gh-proxy 类镜像通常只代理 releases/download,API 仍走原站;
-		// 但部分内网只能走代理 —— 允许前缀式拼接,失败自动回退官方。
-		apiURL = m + "/" + apiURL
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
-	if err != nil {
-		writeErr(w, 500, err.Error())
-		return
-	}
-	req.Header.Set("User-Agent", "BoxHub/update-check")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		// 镜像的 API 路径失败 → 回退官方再试一次
-		if mirror != "" {
-			req2, _ := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/repos/"+singboxRepo+"/releases/latest", nil)
-			req2.Header.Set("User-Agent", "BoxHub/update-check")
-			resp, err = http.DefaultClient.Do(req2)
-		}
+	var (
+		resp *http.Response
+		last error
+	)
+	for _, u := range ghURLCandidates(mirror, apiURL) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
-			writeErr(w, 502, "无法访问 GitHub API(可填镜像地址后重试): "+err.Error())
+			writeErr(w, 500, err.Error())
 			return
 		}
+		req.Header.Set("User-Agent", "BoxHub/update-check")
+		resp, err = http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == 200 {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+			last = fmt.Errorf("HTTP %d (%s)", resp.StatusCode, u)
+		} else {
+			last = fmt.Errorf("%v (%s)", err, u)
+		}
+		resp = nil
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if resp == nil {
+		if last == nil {
+			last = errors.New("没有可用的下载源")
+		}
+		writeErr(w, 502, "无法访问 GitHub API(镜像与直连都失败): "+last.Error())
+		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
@@ -217,7 +262,7 @@ func (s *Server) handleKernelUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	var body struct {
 		Mirror string `json:"mirror"`
-		Tag    string `json:"tag"`    // 指定版本(默认取检测到的 latest)
+		Tag    string `json:"tag"` // 指定版本(默认取检测到的 latest)
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
@@ -242,7 +287,7 @@ func (s *Server) handleKernelUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	file := kernelLatestFile(tag)
-	url := ghAssetURL(body.Mirror, tag, file)
+	rawURL := "https://github.com/" + singboxRepo + "/releases/download/" + tag + "/" + file
 
 	tmpDir, err := os.MkdirTemp("", "boxhub-upgrade")
 	if err != nil {
@@ -251,11 +296,24 @@ func (s *Server) handleKernelUpgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	// 下载走候选链:用户镜像 → 直连 → 内置镜像。内核包几十 MB,
+	// 国内直连 releases 普遍不通,镜像前缀是主要通路。
 	s.reportUpgrade("正在下载 " + file)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	if err := downloadTo(ctx, url, filepath.Join(tmpDir, file)); err != nil {
-		writeErr(w, 502, "下载失败("+url+"): "+err.Error()+" — 内网可填镜像地址")
+	var derr error
+	for _, u := range ghURLCandidates(body.Mirror, rawURL) {
+		s.reportUpgrade("正在下载 " + file + " (" + u + ")")
+		derr = downloadTo(ctx, u, filepath.Join(tmpDir, file))
+		if derr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if derr != nil {
+		writeErr(w, 502, "下载失败(已尝试镜像与直连): "+derr.Error()+" — 内网可填镜像地址")
 		return
 	}
 

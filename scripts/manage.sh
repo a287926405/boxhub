@@ -251,18 +251,67 @@ gh_url() {
     fi
 }
 
+# ------------------------------------------------------------------
+# 多源下载:纯国内网络(直连 GitHub 不通)也要能装。
+# 候选前缀 = 用户镜像(BOXHUB_GH_MIRROR,支持逗号分隔)→ 直连 → 内置镜像。
+# 内置镜像实测(2026-10)支持 raw / releases 大文件 / api;失效会随版本更新淘汰。
+MIRRORS_DEFAULT="https://gh-proxy.com https://gh-proxy.net https://gh.ddlc.top"
+
+github_direct() {
+    if [ "$DL" = "curl" ]; then
+        curl -fsI --connect-timeout 5 --max-time 8 https://github.com >/dev/null 2>&1
+    else
+        wget -q --timeout=5 --tries=1 -O /dev/null https://github.com 2>/dev/null
+    fi
+}
+
+# prefix_list 输出候选镜像前缀,空行表示"直连"。
+prefix_list() {
+    if [ -n "${GH_MIRROR:-}" ]; then
+        printf '%s\n' ${GH_MIRROR} | sed 's:/*$::'
+    elif github_direct; then
+        printf '\n%s\n' "$MIRRORS_DEFAULT"
+    else
+        printf '%s\n' $MIRRORS_DEFAULT
+        printf '\n'
+    fi
+}
+
+# try_sources 依次尝试"每个前缀 × 每个 URL 候选",成功即返回 0。
+# 用法: try_sources 输出文件 URL1 [URL2 ...](URL 为不带前缀的原始地址)
+try_sources() {
+    local out=$1; shift
+    local prefix u
+    while IFS= read -r prefix; do
+        for u in "$@"; do
+            [ -n "$prefix" ] && u="$prefix/$u"
+            if fetch "$u" "$out" 2>/dev/null && [ -s "$out" ]; then
+                return 0
+            fi
+        done
+    done <<EOF
+$(prefix_list)
+EOF
+    return 1
+}
+
 # resolve_latest_tag 取仓库最新 release 的 tag。
 # 先走 API(一次请求拿到准确版本号,不依赖页面结构);
 # 被限流时退回抓 releases/latest 跳转 HTML 里的 tag 链接。
 resolve_latest_tag() {
-    local repo=$1 tag=""
-    tag=$(fetch "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
-        | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -n1 \
-        | sed 's/.*"\([^"]*\)"$/\1/') || true
-    if [ -z "$tag" ]; then
-        tag=$(fetch "https://github.com/${repo}/releases/latest" 2>/dev/null \
-            | grep -oE '/releases/tag/v[0-9.]+' | head -n1 | sed 's|.*/||') || true
-    fi
+    local repo=$1 tag="" prefix u
+    while IFS= read -r prefix; do
+        for u in "https://api.github.com/repos/${repo}/releases/latest" \
+                 "https://github.com/${repo}/releases/latest"; do
+            [ -n "$prefix" ] && u="$prefix/$u"
+            tag=$(fetch "$u" 2>/dev/null \
+                | grep -oE '("tag_name":[[:space:]]*"[^"]+"|/releases/tag/v[0-9.]+)' | head -n1 \
+                | sed -e 's/.*"\([^"]*\)"$/\1/' -e 's|.*/||') || true
+            [ -n "$tag" ] && { printf '%s' "$tag"; return 0; }
+        done
+    done <<EOF
+$(prefix_list)
+EOF
     printf '%s' "$tag"
 }
 
@@ -289,13 +338,11 @@ install_singbox() {
         tag=$(resolve_latest_tag "$SINGBOX_REPO")
     fi
     [ -n "$tag" ] || die "无法确定 sing-box 版本号,可用 BOXHUB_SINGBOX_VERSION=v1.14.4 指定"
-    local url
-    url=$(gh_url "https://github.com/${SINGBOX_REPO}/releases/download/${tag}/sing-box-${tag#v}-linux-${ARCH}.tar.gz")
+    local raw_url="https://github.com/${SINGBOX_REPO}/releases/download/${tag}/sing-box-${tag#v}-linux-${ARCH}.tar.gz"
     info "版本: $tag" >&2
-    info "地址: $url" >&2
-    if ! fetch "$url" "$tmp/singbox.tar.gz"; then
-        warn "sing-box 下载失败(国内直连 GitHub 常见)。可选办法:"
-        warn "  1) 走镜像: BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
+    if ! try_sources "$tmp/singbox.tar.gz" "$raw_url"; then
+        warn "sing-box 下载失败(镜像与直连都试过)。可选办法:"
+        warn "  1) 指定镜像: BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
         warn "  2) 离线: BOXHUB_LOCAL_SINGBOX=/path/to/sing-box bash manage.sh install"
         warn "  3) 指定版本: BOXHUB_SINGBOX_VERSION=v1.14.4 bash manage.sh install"
         die "sing-box 下载失败"
@@ -398,12 +445,16 @@ install_clash_ui() {
     # 和 sing-box 一样支持 GitHub 镜像:国内直连 releases 不通时这是唯一出路。
     # BOXHUB_ZASHBOARD_URL 可整条替换(锁定某个版本、指向自建源,或本地 file:// 路径)。
     url="${BOXHUB_ZASHBOARD_URL:-}"
-    [ -n "$url" ] || url=$(gh_url "https://github.com/${ZASHBOARD_REPO}/releases/latest/download/${ZASHBOARD_ASSET}")
-    # dist.zip 约 9MB;拿不到就跳过,不重试第二次(以前"先探测再重下"要下两遍)
-    if ! timeout 240 sh -c "if [ \"$DL\" = curl ]; then curl -fsSL --connect-timeout 15 --max-time 230 -o '$zip' '$url'; else wget -q --timeout=15 --tries=1 -O '$zip' '$url'; fi" 2>/dev/null; then
-        warn "zashboard 下载失败,已跳过(BoxHub 控制台不受影响): $url"
+    if [ -n "$url" ]; then
+        # 整条替换(锁定版本/自建源/本地路径):行为保持单一来源
+        if ! timeout 240 sh -c "if [ \"$DL\" = curl ]; then curl -fsSL --connect-timeout 15 --max-time 230 -o '$zip' '$url'; else wget -q --timeout=15 --tries=1 -O '$zip' '$url'; fi" 2>/dev/null; then
+            warn "zashboard 下载失败,已跳过(BoxHub 控制台不受影响): $url"
+            return 0
+        fi
+    elif ! try_sources "$zip" "https://github.com/${ZASHBOARD_REPO}/releases/latest/download/${ZASHBOARD_ASSET}"; then
+        warn "zashboard 下载失败,已跳过(BoxHub 控制台不受影响)"
         warn "  走镜像:BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
-        warn "  手动补:下载 $url 解压到 $dest(保留 index.html 在根)后刷新内核面板"
+        warn "  手动补:下载 dist.zip 解压到 $dest(保留 index.html 在根)后刷新内核面板"
         return 0
     fi
     local work="$tmp/zashboard"
@@ -660,12 +711,18 @@ do_install() {
         cp "$BOXHUB_LOCAL_BOXD" "$tmp/boxd"
         info "使用本地文件: $BOXHUB_LOCAL_BOXD"
     else
-        [ -n "$RELEASE_BASE" ] || RELEASE_BASE="https://github.com/${GITHUB_REPO}/releases/latest/download"
-        boxd_url=$(gh_url "${RELEASE_BASE}/boxd-linux-${ARCH}")
-        info "地址: $boxd_url"
-        if ! fetch "$boxd_url" "$tmp/boxd"; then
-            warn "BoxHub 下载失败。可选办法:"
-            warn "  1) 走镜像: BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
+        if [ -n "${BOXHUB_RELEASE_BASE:-}" ]; then
+            # 显式指定了发布源:行为保持单一来源,不做多源回退
+            [ -n "$RELEASE_BASE" ] || RELEASE_BASE="$BOXHUB_RELEASE_BASE"
+            boxd_url=$(gh_url "${RELEASE_BASE}/boxd-linux-${ARCH}")
+            info "地址: $boxd_url"
+            if ! fetch "$boxd_url" "$tmp/boxd"; then
+                warn "BoxHub 下载失败: $boxd_url"
+                die "BoxHub 面板下载失败"
+            fi
+        elif ! try_sources "$tmp/boxd" "https://github.com/${GITHUB_REPO}/releases/latest/download/boxd-linux-${ARCH}"; then
+            warn "BoxHub 下载失败(镜像与直连都试过)。可选办法:"
+            warn "  1) 指定镜像: BOXHUB_GH_MIRROR=https://gh-proxy.com bash manage.sh install"
             warn "  2) 离线: BOXHUB_LOCAL_BOXD=/path/to/boxd bash manage.sh install"
             die "BoxHub 面板下载失败"
         fi
