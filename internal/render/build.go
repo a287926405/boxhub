@@ -974,7 +974,8 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 	// 设备分流模式:按来源设备决定流量走不走代理(与 DNS 分流模式无关)。
 	// 必须排在业务分流规则之前 —— 例外设备是硬覆盖,不该再被后面的
 	// 域名/规则集规则改判,否则"设成直连的设备访问 youtube"还是会被拽进代理。
-	applyDeviceRouting(rt, cfg, r)
+	// 返回的收尾规则要等业务规则全部追加完再放进去(回环的兜底必须最后)。
+	deviceTrailing := applyDeviceRouting(rt, cfg, r)
 
 	// 屏蔽 QUIC:走代理的 UDP 443 直接拒绝,浏览器自动退回 TCP
 	if cfg.Inbounds.BlockQUIC {
@@ -1056,6 +1057,9 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 	//   - 直连流量(域名规则已拦截)也不受影响。
 	// 代价:仅靠 IP 段/geoip 匹配的规则对"只有域名"的连接不生效——这是可接受的,
 	// 因为默认配置里域名类规则已经用 domain_suffix / geosite 覆盖了主要场景。
+
+	// 设备分流模式里"必须排在最后"的规则(目前只有回环兜底)。
+	rt.Rules = append(rt.Rules, deviceTrailing...)
 
 	// 兜底出口必须存在。这里再核一遍:final 指向的出站必须在 outbounds 里生成过,
 	// 否则内核 run 阶段会 FATAL(default outbound not found)。
@@ -1193,28 +1197,40 @@ func DefaultProxyTarget(cfg *config.Config, r *config.Resolver) string {
 // 直连模式下"其余设备走直连"用 invert 表达:sing-box 没有"来源不在列表里"
 // 的直接写法,但可以对整条规则取反,效果就是"除例外设备以外的所有来源"。
 // 不这么做的话,后面按域名匹配的分流规则会把它们重新送进代理。
-func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) {
+// 返回值是"要追加到所有业务规则之后"的收尾规则。
+func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) []SBRule {
 	ex := normalizeSourceCIDRs(cfg.Routing.ModeExceptions)
 	if cfg.Routing.Mode == config.RouteModeDirect {
 		rt.Final = "direct"
-		// 回环地址必须补进例外:内核自己发起的连接(面板首页测速、诊断探针)
-		// 来源是 127.0.0.1,它不是"设备"。不补的话,默认直连模式下这些请求
-		// 会被当成非例外设备走 direct,境外站点全部超时,面板测速直接失效。
-		ex = normalizeSourceCIDRs(append(ex, loopbackCIDRs...))
+		// 例外设备 → 代理。这里只能放真实例外设备:
+		// 若把回环也塞进来,内核自身流量(首页测速、诊断探针)会被硬钉到代理,
+		// 连百度都会走代理 —— 测速就失真了。
+		if len(ex) > 0 {
+			rt.Rules = append(rt.Rules, SBRule{
+				ClientIP: ex, Action: "route", Outbound: defaultProxyTarget(cfg, r),
+			})
+		}
+		// 其余设备 → 直连。回环要从这条里排除,否则内核自己的测速/诊断会被
+		// 当成"非例外设备"掐成直连。
+		guard := normalizeSourceCIDRs(append(append([]string{}, ex...), loopbackCIDRs...))
 		rt.Rules = append(rt.Rules, SBRule{
-			ClientIP: ex, Action: "route", Outbound: defaultProxyTarget(cfg, r),
+			ClientIP: guard, Invert: true, Action: "route", Outbound: "direct",
 		})
-		rt.Rules = append(rt.Rules, SBRule{
-			ClientIP: ex, Invert: true, Action: "route", Outbound: "direct",
-		})
-		return
+		// 回环本身:排在所有业务规则**之后**再兜到代理。
+		// 放前面会把百度也送进代理(国内规则还没来得及匹配);
+		// 不放的话,直连模式 final=direct,内核访问境外站点又会变成直连超时。
+		// 放最后正好是"国内走前面的直连规则、其余走代理"。
+		return []SBRule{{
+			ClientIP: loopbackCIDRs, Action: "route", Outbound: defaultProxyTarget(cfg, r),
+		}}
 	}
 	if len(ex) == 0 {
-		return
+		return nil
 	}
 	rt.Rules = append(rt.Rules, SBRule{
 		ClientIP: ex, Action: "route", Outbound: "direct",
 	})
+	return nil
 }
 
 // loopbackCIDRs 内核自身流量的来源地址(回环)。它们不是局域网设备,

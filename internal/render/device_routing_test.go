@@ -105,7 +105,7 @@ func TestDeviceRoutingDirectModeExceptionGoesProxy(t *testing.T) {
 		}
 		if r.Invert && r.Outbound == "direct" {
 			toDirectInverted = r
-		} else if !r.Invert && r.Outbound != "direct" {
+		} else if !r.Invert && r.Outbound != "direct" && !containsLoopback(r.ClientIP) {
 			toProxy = r
 		}
 	}
@@ -179,9 +179,20 @@ func TestDeviceRoutingNormalizesExceptions(t *testing.T) {
 // (内核从 127.0.0.1 经混合端口发起)被当成非例外设备走了直连,
 // 境外站点全部超时,测速四项只剩百度有数。
 func TestDeviceRoutingDirectModeExcludesLoopback(t *testing.T) {
-	rt := deviceRoute(t, config.RouteModeDirect, nil)
+	rt := deviceRoute(t, config.RouteModeDirect, []string{"10.10.10.35"})
 
-	var proxyRule, invertRule *render.SBRule
+	isLoopback := func(c string) bool { return c == "127.0.0.1/32" || c == "::1/128" }
+	hasLoopback := func(r *render.SBRule) bool {
+		for _, c := range r.ClientIP {
+			if isLoopback(c) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var invertRule *render.SBRule
+	var exceptionRule *render.SBRule
 	for i := range rt.Rules {
 		r := &rt.Rules[i]
 		if len(r.ClientIP) == 0 {
@@ -189,26 +200,33 @@ func TestDeviceRoutingDirectModeExcludesLoopback(t *testing.T) {
 		}
 		if r.Invert {
 			invertRule = r
-		} else {
-			proxyRule = r
+			continue
 		}
-	}
-	if invertRule == nil || proxyRule == nil {
-		t.Fatal("默认直连模式应生成「例外→代理」和「其余→直连」两条规则")
-	}
-	hasLoopback := func(r *render.SBRule) bool {
-		for _, c := range r.ClientIP {
-			if c == "127.0.0.1/32" || c == "::1/128" {
-				return true
-			}
+		if hasLoopback(r) {
+			continue // 回环兜底规则单独检查
 		}
-		return false
+		exceptionRule = r
+	}
+	if invertRule == nil {
+		t.Fatal("缺少「其余设备走直连」的反向规则")
 	}
 	if !hasLoopback(invertRule) {
-		t.Fatal("「其余设备走直连」的反向规则必须排除回环,否则内核自己的测速/诊断会被掐断")
+		t.Fatal("反向规则必须排除回环,否则内核自己的测速/诊断会被掐成直连")
 	}
-	if !hasLoopback(proxyRule) {
-		t.Fatal("回环要显式走代理,面板测速才能测到境外站点")
+	if exceptionRule == nil {
+		t.Fatal("缺少「例外设备走代理」的规则")
+	}
+	if hasLoopback(exceptionRule) {
+		t.Fatal("回环不该出现在「例外设备→代理」里,否则内核访问国内站点也会走代理")
+	}
+
+	// 回环兜底必须排在所有业务规则之后:放前面会把百度也送进代理。
+	last := rt.Rules[len(rt.Rules)-1]
+	if !hasLoopback(&last) {
+		t.Fatalf("回环兜底规则应该是最后一条(实际最后一条: %+v)", last)
+	}
+	if last.Outbound == "direct" {
+		t.Fatal("回环兜底应指向代理,否则直连模式下内核测不到境外站点")
 	}
 }
 
@@ -224,4 +242,14 @@ func TestDeviceRoutingProxyModeKeepsLoopbackOut(t *testing.T) {
 			t.Fatalf("默认代理模式的例外规则不该包含回环: %v", r.ClientIP)
 		}
 	}
+}
+
+// containsLoopback 判断来源列表里是否含回环地址。
+func containsLoopback(list []string) bool {
+	for _, c := range list {
+		if c == "127.0.0.1/32" || c == "::1/128" {
+			return true
+		}
+	}
+	return false
 }
