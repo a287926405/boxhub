@@ -36,7 +36,7 @@ func TestLocalPathAndNeedFetch(t *testing.T) {
 	}
 
 	f := filepath.Join(dir, FileName(u, "binary"))
-	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(f, []byte("SRS\x02cached-body"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if p := LocalPath(dir, u, "binary"); p != f {
@@ -67,7 +67,7 @@ func TestEnsureDownloadsAndCaches(t *testing.T) {
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		w.Write([]byte("rule-set-body"))
+		w.Write([]byte("SRS\x02rule-set-body"))
 	}))
 	defer srv.Close()
 
@@ -93,7 +93,7 @@ func TestEnsureDownloadsAndCaches(t *testing.T) {
 			t.Fatalf("%s 没有落地", r.URL)
 		}
 		b, _ := os.ReadFile(p)
-		if string(b) != "rule-set-body" {
+		if string(b) != "SRS\x02rule-set-body" {
 			t.Fatalf("内容不对: %q", b)
 		}
 	}
@@ -129,5 +129,59 @@ func TestEnsureNoopWithoutDir(t *testing.T) {
 	res := Ensure(context.Background(), "", []Ref{{URL: "https://example.com/a.srs"}}, "")
 	if res.Downloaded != 0 || res.Failed != 0 {
 		t.Fatal("没有目录时应当什么都不做")
+	}
+}
+
+// GitHub /blob/ 网页返回的是 HTML,绝不能落盘成 .srs。
+func TestEnsureRejectsHTML(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<!DOCTYPE html><html><body>not a rule set</body></html>"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	u := srv.URL + "/cloudflare.srs"
+	res := Ensure(context.Background(), dir, []Ref{{URL: u, Format: "binary"}}, "")
+	if res.Failed != 1 {
+		t.Fatalf("HTML 应记为失败,实际 Failed=%d", res.Failed)
+	}
+	if LocalPath(dir, u, "binary") != "" {
+		t.Fatal("HTML 不该被缓存成规则集")
+	}
+}
+
+// 已经缓存了坏文件(旧版本留下的)时,LocalPath 必须拒绝,
+// 否则渲染会一直用 type:local 指向坏文件,内核永远起不来。
+func TestLocalPathIgnoresInvalidCache(t *testing.T) {
+	dir := t.TempDir()
+	u := "https://example.com/bad.srs"
+	f := filepath.Join(dir, FileName(u, "binary"))
+	if err := os.WriteFile(f, []byte("<!DOCTYPE html><html>oops</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := LocalPath(dir, u, "binary"); p != "" {
+		t.Fatalf("坏缓存不该被当作可用规则集: %s", p)
+	}
+	if !NeedFetch(dir, u, "binary") {
+		t.Fatal("坏缓存应触发重新下载")
+	}
+}
+
+func TestValidateFileSource(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	if err := os.WriteFile(good, []byte(`{"version":2,"rules":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFile(good, "source"); err != nil {
+		t.Fatalf("合法 JSON 规则集不应报错: %v", err)
+	}
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`<!DOCTYPE html>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFile(bad, "source"); err == nil {
+		t.Fatal("HTML 伪装成 JSON 应报错")
 	}
 }

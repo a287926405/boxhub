@@ -380,6 +380,69 @@ func (m *Manager) Reload(newConfigPath string) error {
 	return m.Restart()
 }
 
+// RestartWith 用 raw 原地切换内核配置;新配置起不来就回滚旧配置继续跑。
+//
+// 为什么不能"先写盘再重启":旧流程是写 core.json 之后才 Reload,新配置一旦
+// 起不来(实测踩过 GitHub /blob/ 坏规则集、7890 端口被占两种),用户看到
+// "配置已保存,但内核重启失败",而旧内核已经被停掉、磁盘上只剩这份坏配置,
+// 就是全屋断网,面板里想改回来还得等内核先活过来。
+//
+// 这里把写盘夹在"停"和"起"之间,任何一个失败点都能把旧配置原样写回去再拉起。
+// started 表示最终是否有配置在跑(新配置,或回滚后的旧配置)。
+func (m *Manager) RestartWith(raw []byte) (started bool, err error) {
+	if err := os.MkdirAll(filepath.Dir(m.configPath), 0o700); err != nil {
+		return true, fmt.Errorf("创建数据目录失败: %w", err)
+	}
+	backup, hadOld := readFileIfExists(m.configPath)
+
+	m.mu.Lock()
+	wasRunning := m.cmd != nil
+	m.mu.Unlock()
+
+	if wasRunning {
+		if serr := m.Stop(); serr != nil {
+			// 旧内核停不下来就别动磁盘,让它继续服务
+			return true, fmt.Errorf("停止旧内核失败: %w", serr)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	if werr := os.WriteFile(m.configPath, raw, 0o600); werr != nil {
+		if hadOld {
+			_ = os.WriteFile(m.configPath, backup, 0o600)
+			_ = m.Start()
+		}
+		return hadOld, fmt.Errorf("写入内核配置失败: %w", werr)
+	}
+
+	startErr := m.Start()
+	if startErr == nil {
+		return true, nil
+	}
+	if !hadOld {
+		return false, startErr
+	}
+
+	// 新配置起不来:把旧配置写回去重新拉起
+	reason := m.lastFatalReason()
+	_ = os.WriteFile(m.configPath, backup, 0o600)
+	if rerr := m.Start(); rerr != nil {
+		return false, fmt.Errorf("新配置启动失败(%v);回滚旧配置也失败(%v)", startErr, rerr)
+	}
+	if reason == "" {
+		reason = startErr.Error()
+	}
+	return true, errors.New(reason)
+}
+
+func readFileIfExists(p string) ([]byte, bool) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
 // TailLog 返回最后 n 行内核日志。
 func (m *Manager) TailLog(n int) ([]string, error) {
 	raw, err := os.ReadFile(m.logPath)

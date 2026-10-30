@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strings"
 	"syscall"
@@ -1400,13 +1401,51 @@ func ruleSetTag(raw string) string {
 	return fmt.Sprintf("%s-%x", s, sum[:4])
 }
 
-// normalizeRuleSetURL 把三种写法统一成可下载地址:
+// normalizeGitHubFileURL 把 GitHub 的「网页链接」改成「原始文件链接」。
+//
+// 真实故障:用户在 GitHub 文件页点“复制链接”,拿到的是
+//
+//	https://github.com/MetaCubeX/meta-rules-dat/blob/sing/geo/geoip/cloudflare.srs
+//
+// 这个地址返回的是 HTML 网页,不是 .srs。内核把它当规则集解析,直接
+//
+//	invalid sing-box rule-set file
+//
+// 然后整个内核起不来。GitHub 的 /raw/ 与 raw.githubusercontent.com 才是文件本体。
+//
+// 只转换 /blob/,已经能用的 /raw/ 与 raw.githubusercontent.com 保持原样:
+// 后者是现有缓存文件名的哈希输入,改了会让全部本地缓存失效。
+func normalizeGitHubFileURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	host := strings.ToLower(u.Hostname())
+	if host != "github.com" && host != "www.github.com" {
+		return raw
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	// /<owner>/<repo>/blob/<ref>/<path...>
+	if len(parts) < 5 || !strings.EqualFold(parts[2], "blob") {
+		return raw
+	}
+	owner, repo := parts[0], parts[1]
+	rest := parts[3:]
+	if owner == "" || repo == "" || len(rest) < 2 {
+		return raw
+	}
+	return "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + strings.Join(rest, "/")
+}
+
+// normalizeRuleSetURL 把几种写法统一成可下载地址:
 //
 //	"srs:https://..."      → sing-box 二进制规则集
 //	"https://...srs"       → 二进制
 //	"https://...json"      → 源格式
 //	"geoip:cn"             → sing-geoip 官方仓库
 //	"geosite:cn"           → sing-geosite 官方仓库
+//
+// GitHub 的网页链接(/blob/)会先转成 raw 原始文件链接,否则下载到的是 HTML。
 func normalizeRuleSetURL(raw string) (url, format string, ok bool) {
 	raw = strings.TrimSpace(raw)
 	switch {
@@ -1421,7 +1460,13 @@ func normalizeRuleSetURL(raw string) (url, format string, ok bool) {
 	case strings.HasPrefix(raw, "srs:"):
 		return strings.TrimPrefix(raw, "srs:"), "binary", true
 	case strings.HasPrefix(raw, "http://"), strings.HasPrefix(raw, "https://"):
-		if strings.HasSuffix(strings.ToLower(raw), ".json") {
+		raw = normalizeGitHubFileURL(raw)
+		// 判扩展名时忽略查询串与锚点(例如 .json?raw=1)
+		path := raw
+		if i := strings.IndexAny(path, "?#"); i >= 0 {
+			path = path[:i]
+		}
+		if strings.HasSuffix(strings.ToLower(path), ".json") {
 			return raw, "source", true
 		}
 		return raw, "binary", true

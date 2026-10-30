@@ -341,6 +341,17 @@ func (s *Server) apply(mutate func(cfg *config.Config) error) (*applyResult, err
 	if buildErr != nil {
 		return nil, buildErr
 	}
+	// 保存前先预检本次引用的远程规则集(下载并验证内容)。
+	// sing-box check 不会真的下载 remote rule-set,坏链接(GitHub /blob/ 网页、
+	// 404、内容不是 SRS/JSON)能通过 check,却让内核在启动时 FATAL。
+	if err := s.preflightRuleSets(sb); err != nil {
+		return nil, err
+	}
+	// 预检通过后规则集已落地缓存,重新渲染把它们变成 type:local,
+	// 内核启动不再依赖网络与代理。
+	if sb, buildErr = s.build(next); buildErr != nil {
+		return nil, buildErr
+	}
 	// 开了 53 端口 DNS 入口却没生成入站,说明端口被别的程序占了。
 	// 这种情况必须让用户看见:网关模式下所有设备都把 DNS 指向本机,
 	// 入站没起来就是全网 DNS 超时(浏览器 ERR_NAME_NOT_RESOLVED)。
@@ -382,19 +393,20 @@ func (s *Server) apply(mutate func(cfg *config.Config) error) (*applyResult, err
 		}
 		return nil, errors.New(strings.Join(msgs, "; "))
 	}
-	// 写正式配置并热重启
-	finalPath := filepath.Join(s.dataDir, "core.json")
-	if err := os.WriteFile(finalPath, raw, 0o600); err != nil {
-		return nil, err
+	// 原地切换内核:停 → 写 core.json → 起,任一步失败自动回滚旧配置。
+	//
+	// 旧流程是"先写 core.json 再 Reload",新配置一旦起不来(实测踩过
+	// /blob/ 坏规则集与端口被占两种),旧内核已被停掉、磁盘上只剩坏配置,
+	// 表现为"配置已保存,但内核重启失败"且全屋断网。RestartWith 保证
+	// 任何失败点都有旧配置继续跑;这里面板配置保持已保存状态,方便用户
+	// 在面板上改掉坏链接后重试。
+	if _, err := s.kernel.RestartWith(raw); err != nil {
+		s.lastErr = err.Error()
+		return nil, fmt.Errorf("内核切换失败,已自动回滚旧配置继续运行(配置已保存,请修正后重试): %w", err)
 	}
 	s.lastGen = raw
 	s.lastGenAt = time.Now()
 	res := &applyResult{Warnings: warns}
-	if err := s.kernel.Reload(finalPath); err != nil {
-		// 到这里配置已经校验过,失败多半是端口被占用等运行期问题
-		s.lastErr = err.Error()
-		return nil, fmt.Errorf("配置已保存,但内核重启失败: %w", err)
-	}
 	res.Restarted = true
 	s.lastErr = ""
 	go s.prefetchRuleSets()
@@ -442,6 +454,52 @@ func (s *Server) build(cfg *config.Config) (*render.SBConfig, error) {
 	}
 	ctx.RuleSetPaths = paths
 	return render.Build(cfg, ctx)
+}
+
+// preflightRuleSets 在保存配置、切换内核之前,把本次渲染仍为 remote 的
+// 规则集同步下载并校验一遍。
+//
+// sing-box check 不会下载远程规则集,坏链接要到内核启动才 FATAL;
+// 这里失败时 apply 直接返回错误,配置不落盘、内核不动,旧配置继续服务。
+func (s *Server) preflightRuleSets(sb *render.SBConfig) error {
+	var refs []ruleset.Ref
+	seen := map[string]bool{}
+	for _, rs := range sb.Route.RuleSet {
+		if rs.Type != "remote" || rs.URL == "" || seen[rs.URL] {
+			continue
+		}
+		seen[rs.URL] = true
+		refs = append(refs, ruleset.Ref{URL: rs.URL, Format: rs.Format})
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+
+	proxy := ""
+	if s.kernel.Status().Running {
+		if addr := s.localProxyAddr(); addr != "" {
+			proxy = "http://" + addr
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel()
+	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy)
+
+	var missing []string
+	for _, ref := range refs {
+		if ruleset.LocalPath(s.ruleSetDir(), ref.URL, ref.Format) == "" {
+			missing = append(missing, ref.URL)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	detail := strings.Join(res.Errors, ";")
+	if detail == "" {
+		detail = "下载超时,或内容不是有效的 sing-box 规则集"
+	}
+	return fmt.Errorf("规则集预检失败,配置未保存(旧配置继续运行): %s;%s",
+		strings.Join(missing, "、"), detail)
 }
 
 // prefetchRuleSets 后台把远程规则集缓存到本地,供下次启动直接使用。

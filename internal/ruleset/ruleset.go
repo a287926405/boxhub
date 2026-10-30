@@ -14,9 +14,12 @@
 package ruleset
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -37,6 +40,9 @@ const downloadTimeout = 90 * time.Second
 // concurrency 同时下载的数量。规则集动辄几 MB,并发太高会把代理打满。
 const concurrency = 4
 
+// maxRuleSetSize 单个规则集文件上限,防止把磁盘写满。
+const maxRuleSetSize = 64 << 20
+
 // FileName 返回某个 URL 对应的本地文件名。
 //
 // 用 URL 的哈希而不是可读名:不同规则集可能同名(instagram.srs / geosite/instagram.srs),
@@ -50,23 +56,98 @@ func FileName(rawURL, format string) string {
 	return hex.EncodeToString(sum[:8]) + "." + ext
 }
 
-// LocalPath 返回已存在的本地文件路径;不存在返回空串。
+// ValidateFile 检查一个本地文件是否真的是 sing-box 规则集。
+//
+// 真实故障:GitHub 的 /blob/ 网页链接会返回 200 + HTML,旧代码只看文件
+// 大小,于是把 HTML 当 .srs 缓存下来;之后每次启动都渲染成 type:local,
+// 内核固定报 invalid sing-box rule-set file,而且删掉配置也没用 ——
+// 必须先删缓存文件。所以缓存命中前必须验证内容。
+func ValidateFile(path, format string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st.Size() == 0 {
+		return errors.New("空文件")
+	}
+
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(f, head)
+	head = head[:n]
+	if looksLikeHTML(head) {
+		return errors.New("下载到的是网页(HTML),不是规则集文件;GitHub 链接请用 raw 地址")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	if strings.EqualFold(format, "source") {
+		var doc struct {
+			Version int             `json:"version"`
+			Rules   json.RawMessage `json:"rules"`
+		}
+		if err := json.NewDecoder(io.LimitReader(f, maxRuleSetSize)).Decode(&doc); err != nil {
+			return fmt.Errorf("JSON 解析失败: %w", err)
+		}
+		if doc.Version <= 0 {
+			return errors.New("不是有效的 sing-box 源格式规则集(缺少 version)")
+		}
+		if len(doc.Rules) == 0 {
+			return errors.New("不是有效的 sing-box 源格式规则集(缺少 rules)")
+		}
+		return nil
+	}
+
+	var hdr [4]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return fmt.Errorf("文件太短,读不到规则集头: %w", err)
+	}
+	if !bytes.Equal(hdr[:3], []byte("SRS")) {
+		return fmt.Errorf("不是 sing-box 二进制规则集(文件头为 %q)", hdr[:3])
+	}
+	if hdr[3] == 0 {
+		return errors.New("规则集版本号为 0,文件无效")
+	}
+	return nil
+}
+
+func looksLikeHTML(head []byte) bool {
+	t := bytes.TrimSpace(head)
+	if len(t) == 0 {
+		return false
+	}
+	return t[0] == '<' ||
+		bytes.HasPrefix(bytes.ToLower(t), []byte("<!doctype")) ||
+		bytes.HasPrefix(bytes.ToLower(t), []byte("<html"))
+}
+
+// LocalPath 返回已存在且内容有效的本地文件路径;不存在/损坏返回空串。
 func LocalPath(dir, rawURL, format string) string {
 	if dir == "" || rawURL == "" {
 		return ""
 	}
 	p := filepath.Join(dir, FileName(rawURL, format))
 	if st, err := os.Stat(p); err == nil && st.Size() > 0 {
-		return p
+		if err := ValidateFile(p, format); err == nil {
+			return p
+		}
 	}
 	return ""
 }
 
-// NeedFetch 判断这个 URL 是否需要(重新)下载。
+// NeedFetch 判断这个 URL 是否需要(重新)下载。损坏的缓存也视为需要下载。
 func NeedFetch(dir, rawURL, format string) bool {
 	p := filepath.Join(dir, FileName(rawURL, format))
 	st, err := os.Stat(p)
 	if err != nil || st.Size() == 0 {
+		return true
+	}
+	if err := ValidateFile(p, format); err != nil {
 		return true
 	}
 	return time.Since(st.ModTime()) > MaxAge
@@ -178,6 +259,9 @@ func fetchOne(ctx context.Context, client *http.Client, dir string, r Ref) error
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	if ct := strings.ToLower(resp.Header.Get("Content-Type")); strings.Contains(ct, "text/html") {
+		return errors.New("返回的是网页(HTML),不是规则集文件;GitHub 链接请用 raw 地址")
+	}
 
 	dest := filepath.Join(dir, FileName(r.URL, r.Format))
 	tmp := dest + ".tmp"
@@ -185,14 +269,25 @@ func fetchOne(ctx context.Context, client *http.Client, dir string, r Ref) error
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, io.LimitReader(resp.Body, 64<<20)); err != nil {
+	n, err := io.Copy(f, io.LimitReader(resp.Body, maxRuleSetSize+1))
+	if err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
 	}
+	if n > maxRuleSetSize {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("文件超过 %d MB,拒绝缓存", maxRuleSetSize>>20)
+	}
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
 		return err
+	}
+	// 落盘前先校验:防止把 HTML/404 页面当成规则集缓存下来。
+	if err := ValidateFile(tmp, r.Format); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("下载内容无效: %w", err)
 	}
 	return os.Rename(tmp, dest)
 }
