@@ -1197,9 +1197,10 @@ func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) {
 	ex := normalizeSourceCIDRs(cfg.Routing.ModeExceptions)
 	if cfg.Routing.Mode == config.RouteModeDirect {
 		rt.Final = "direct"
-		if len(ex) == 0 {
-			return
-		}
+		// 回环地址必须补进例外:内核自己发起的连接(面板首页测速、诊断探针)
+		// 来源是 127.0.0.1,它不是"设备"。不补的话,默认直连模式下这些请求
+		// 会被当成非例外设备走 direct,境外站点全部超时,面板测速直接失效。
+		ex = normalizeSourceCIDRs(append(ex, loopbackCIDRs...))
 		rt.Rules = append(rt.Rules, SBRule{
 			ClientIP: ex, Action: "route", Outbound: defaultProxyTarget(cfg, r),
 		})
@@ -1215,6 +1216,10 @@ func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) {
 		ClientIP: ex, Action: "route", Outbound: "direct",
 	})
 }
+
+// loopbackCIDRs 内核自身流量的来源地址(回环)。它们不是局域网设备,
+// 不该被「设备分流模式」当成普通客户端处理。
+var loopbackCIDRs = []string{"127.0.0.1/32", "::1/128"}
 
 // normalizeSourceCIDRs 去空白、去重,并丢弃空行。
 func normalizeSourceCIDRs(in []string) []string {

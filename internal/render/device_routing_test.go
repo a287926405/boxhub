@@ -79,8 +79,14 @@ func TestDeviceRoutingDirectModeFinalIsDirect(t *testing.T) {
 	if rt.Final != "direct" {
 		t.Fatalf("默认直连模式的兜底出口应为 direct,实际 %q", rt.Final)
 	}
-	if r := firstSourceRule(rt); r != nil {
-		t.Fatalf("没有例外设备时不该生成来源规则: %+v", r)
+	// 没有配置例外设备时,来源规则只会用来放行回环(内核自身流量),
+	// 不能出现任何局域网设备地址。
+	for _, r := range rt.Rules {
+		for _, c := range r.ClientIP {
+			if c != "127.0.0.1/32" && c != "::1/128" {
+				t.Fatalf("没配置例外设备却生成了设备来源规则: %v", r.ClientIP)
+			}
+		}
 	}
 }
 
@@ -164,5 +170,58 @@ func TestDeviceRoutingNormalizesExceptions(t *testing.T) {
 	}
 	if len(r.ClientIP) != 1 || r.ClientIP[0] != "10.10.10.35" {
 		t.Fatalf("例外设备没有去空白/去重: %v", r.ClientIP)
+	}
+}
+
+// 内核自身流量(来源 127.0.0.1)不能被当成"设备"。
+//
+// 这是真实故障:用户把设备分流模式设成"默认直连"后,面板首页的测速
+// (内核从 127.0.0.1 经混合端口发起)被当成非例外设备走了直连,
+// 境外站点全部超时,测速四项只剩百度有数。
+func TestDeviceRoutingDirectModeExcludesLoopback(t *testing.T) {
+	rt := deviceRoute(t, config.RouteModeDirect, nil)
+
+	var proxyRule, invertRule *render.SBRule
+	for i := range rt.Rules {
+		r := &rt.Rules[i]
+		if len(r.ClientIP) == 0 {
+			continue
+		}
+		if r.Invert {
+			invertRule = r
+		} else {
+			proxyRule = r
+		}
+	}
+	if invertRule == nil || proxyRule == nil {
+		t.Fatal("默认直连模式应生成「例外→代理」和「其余→直连」两条规则")
+	}
+	hasLoopback := func(r *render.SBRule) bool {
+		for _, c := range r.ClientIP {
+			if c == "127.0.0.1/32" || c == "::1/128" {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasLoopback(invertRule) {
+		t.Fatal("「其余设备走直连」的反向规则必须排除回环,否则内核自己的测速/诊断会被掐断")
+	}
+	if !hasLoopback(proxyRule) {
+		t.Fatal("回环要显式走代理,面板测速才能测到境外站点")
+	}
+}
+
+// 默认代理模式下回环本来就按正常规则走代理,不该被塞进"例外设备→直连"里。
+func TestDeviceRoutingProxyModeKeepsLoopbackOut(t *testing.T) {
+	rt := deviceRoute(t, config.RouteModeProxy, []string{"10.10.10.35"})
+	r := firstSourceRule(rt)
+	if r == nil {
+		t.Fatal("没有生成来源规则")
+	}
+	for _, c := range r.ClientIP {
+		if c == "127.0.0.1/32" || c == "::1/128" {
+			t.Fatalf("默认代理模式的例外规则不该包含回环: %v", r.ClientIP)
+		}
 	}
 }
