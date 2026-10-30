@@ -81,15 +81,15 @@ type SBInbound struct {
 // ---------------------------------------------------------------------------
 
 type SBOutbound struct {
-	Type        string `json:"type"`
-	Tag         string `json:"tag"`
-	Server      string `json:"server,omitempty"`
-	ServerPort  int    `json:"server_port,omitempty"`
+	Type       string `json:"type"`
+	Tag        string `json:"tag"`
+	Server     string `json:"server,omitempty"`
+	ServerPort int    `json:"server_port,omitempty"`
 	// detour 指向另一个出站:流量先经过它,再连到本出站的 server。
 	// 链式代理就是靠这个字段实现的。
-	Detour   string `json:"detour,omitempty"`
+	Detour    string   `json:"detour,omitempty"`
 	Outbounds []string `json:"outbounds,omitempty"` // selector / urltest
-	Default  string `json:"default,omitempty"`      // selector
+	Default   string   `json:"default,omitempty"`   // selector
 	// urltest 参数
 	URL           string           `json:"url,omitempty"`
 	Interval      string           `json:"interval,omitempty"`
@@ -107,19 +107,19 @@ type SBOutbound struct {
 	Flow     string `json:"flow,omitempty"`
 
 	// 传输
-	TLS       *SBTLS       `json:"tls,omitempty"`
-	Transport *SBTransport `json:"transport,omitempty"`
-	Multiplex *SBMultiplex `json:"multiplex,omitempty"`
-	Plugin    string       `json:"plugin,omitempty"`
+	TLS        *SBTLS            `json:"tls,omitempty"`
+	Transport  *SBTransport      `json:"transport,omitempty"`
+	Multiplex  *SBMultiplex      `json:"multiplex,omitempty"`
+	Plugin     string            `json:"plugin,omitempty"`
 	PluginOpts map[string]string `json:"plugin_opts,omitempty"`
 
-	Network       string     `json:"network,omitempty"`
-	UDPOverTCP    *SBUDPOverTCP `json:"udp_over_tcp,omitempty"`
-	UpMbps        int        `json:"up_mbps,omitempty"`
-	DownMbps      int        `json:"down_mbps,omitempty"`
-	Obfs          *SBObfs    `json:"obfs,omitempty"`
-	CongestionControl string  `json:"congestion_control,omitempty"`
-	UDPRelayMode  string     `json:"udp_relay_mode,omitempty"`
+	Network           string        `json:"network,omitempty"`
+	UDPOverTCP        *SBUDPOverTCP `json:"udp_over_tcp,omitempty"`
+	UpMbps            int           `json:"up_mbps,omitempty"`
+	DownMbps          int           `json:"down_mbps,omitempty"`
+	Obfs              *SBObfs       `json:"obfs,omitempty"`
+	CongestionControl string        `json:"congestion_control,omitempty"`
+	UDPRelayMode      string        `json:"udp_relay_mode,omitempty"`
 
 	// wireguard
 	LocalAddress []string `json:"address,omitempty"`
@@ -225,10 +225,10 @@ type SBRule struct {
 	Invert        bool     `json:"invert,omitempty"`
 
 	// 动作
-	Action      string `json:"action,omitempty"`
-	Outbound    string `json:"outbound,omitempty"`
-	Server      string `json:"server,omitempty"`      // action=resolve / hijack-dns
-	NoDrop      bool   `json:"no_drop,omitempty"`
+	Action       string `json:"action,omitempty"`
+	Outbound     string `json:"outbound,omitempty"`
+	Server       string `json:"server,omitempty"` // action=resolve / hijack-dns
+	NoDrop       bool   `json:"no_drop,omitempty"`
 	SniffTimeout string `json:"sniff_timeout,omitempty"`
 
 	// action=logical(组内 AND)
@@ -240,13 +240,16 @@ type SBRule struct {
 type SBLogicalRule SBRule
 
 type SBRuleSet struct {
-	Tag            string `json:"tag"`
-	Type           string `json:"type"`
-	Format         string `json:"format,omitempty"`
-	URL            string `json:"url,omitempty"`
+	Tag    string `json:"tag"`
+	Type   string `json:"type"`
+	Format string `json:"format,omitempty"`
+	URL    string `json:"url,omitempty"`
+	// Path 本地规则集路径。有本地缓存时用 type:local + path,
+	// 内核启动就不需要联网下载(下载失败会 FATAL,全屋断网)。
+	Path           string `json:"path,omitempty"`
 	UpdateInterval string `json:"update_interval,omitempty"`
 	// DownloadDetour 规则集下载所经的出站;与 HTTPClient 互斥。
-	DownloadDetour string     `json:"download_detour,omitempty"`
+	DownloadDetour string        `json:"download_detour,omitempty"`
 	HTTPClient     *SBHTTPClient `json:"http_client,omitempty"`
 }
 

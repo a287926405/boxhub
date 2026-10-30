@@ -91,9 +91,17 @@ func Build(cfg *config.Config, ctx Context) (*SBConfig, error) {
 			}
 		}
 		if !found {
+			// 与 addRuleSet 保持一致:有本地缓存就用本地文件,
+			// 否则内核启动仍会为它联网下载(国内直连 github 不通 → FATAL)。
+			if localPath, ok := ctx.RuleSetPaths[url]; ok && localPath != "" {
+				route.RuleSet = append(route.RuleSet, SBRuleSet{
+					Tag: tag, Type: "local", Format: fmtType, Path: localPath,
+				})
+				continue
+			}
 			route.RuleSet = append(route.RuleSet, SBRuleSet{
 				Tag: tag, Type: "remote", Format: fmtType, URL: url,
-				UpdateInterval: "24h", DownloadDetour: "direct",
+				UpdateInterval: "24h", DownloadDetour: downloadDetour(cfg, r),
 			})
 		}
 	}
@@ -138,6 +146,9 @@ type Context struct {
 	ClashUI string
 	// RuleSetDir 规则集缓存目录。
 	RuleSetDir string
+	// RuleSetPaths 已落地的本地规则集:URL -> 本地文件路径。
+	// 命中的规则集渲染成 type:local,内核启动不再联网下载。
+	RuleSetPaths map[string]string
 	// KernelRunning 表示渲染这一刻内核正在运行(即将被停掉换成新配置)。
 	//
 	// 它只影响 53 端口 DNS 入站的取舍:内核自己在跑的时候必然占着 53,
@@ -152,10 +163,10 @@ type Context struct {
 
 func buildOutbounds(cfg *config.Config, r *config.Resolver, tg tags) ([]SBOutbound, error) {
 	var (
-		nodes   []SBOutbound // 普通节点,保持添加顺序
-		chains  []SBOutbound // 链式代理
-		groups  []SBOutbound // 节点组
-		named   = map[string]bool{}
+		nodes  []SBOutbound // 普通节点,保持添加顺序
+		chains []SBOutbound // 链式代理
+		groups []SBOutbound // 节点组
+		named  = map[string]bool{}
 	)
 
 	add := func(ob SBOutbound, kind string) error {
@@ -709,6 +720,7 @@ func buildDNS(cfg *config.Config, r *config.Resolver, tg tags) (*SBDNS, error) {
 // 语义(对齐 SMBox):
 //   - 默认代理(proxy): 所有设备走 sing-box 解析(FakeIP);例外设备真实直连解析。
 //   - 默认直连(direct): 所有设备真实直连解析;例外设备走 sing-box(FakeIP)。
+//
 // 注意这些规则只影响 A/AAAA;国内域名的直连解析规则在前面,天然优先于这里。
 func dnsModeRules(d config.DNSSettings, directTag string) []SBDNSRule {
 	if len(d.ModeExceptions) == 0 {
@@ -922,8 +934,8 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 		proxyRes = directRes
 	}
 	rt := &SBRoute{
-		AutoDetectInterface:   true,
-		Final:                 defaultProxyTarget(cfg, r),
+		AutoDetectInterface: true,
+		Final:               defaultProxyTarget(cfg, r),
 		// 默认域名解析器用直连 DNS。
 		//
 		// 这里的取舍(踩过坑):
@@ -948,6 +960,14 @@ func buildRoute(cfg *config.Config, r *config.Resolver, ctx Context, tg tags) (*
 		url, fmtType, ok := normalizeRuleSetURL(raw)
 		if !ok {
 			return ""
+		}
+		// 本地已有缓存就用本地文件:内核启动不必联网,也就不会因为
+		// 下载失败(国内直连 github 不通)FATAL 起不来。
+		if localPath, ok := ctx.RuleSetPaths[url]; ok && localPath != "" {
+			rsByTag[tag] = SBRuleSet{
+				Tag: tag, Type: "local", Format: fmtType, Path: localPath,
+			}
+			return tag
 		}
 		rsByTag[tag] = SBRuleSet{
 			Tag: tag, Type: "remote", Format: fmtType, URL: url,
@@ -1187,6 +1207,7 @@ func DefaultProxyTarget(cfg *config.Config, r *config.Resolver) string {
 //  3. 第一个启用的非动态节点组
 //  4. 第一个启用的节点
 //  5. direct
+//
 // applyDeviceRouting 按「设备分流模式」改写最终出口与来源 IP 规则。
 //
 // 语义:

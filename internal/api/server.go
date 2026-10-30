@@ -30,6 +30,7 @@ import (
 	"boxhub/internal/config"
 	"boxhub/internal/kernel"
 	"boxhub/internal/render"
+	"boxhub/internal/ruleset"
 	"boxhub/internal/store"
 	"boxhub/internal/sub"
 )
@@ -57,7 +58,7 @@ type Server struct {
 	dnsTrack *dnsTracker
 
 	// 流量速率计算:保存上一次的累计读数
-	trafficMu     sync.Mutex
+	trafficMu       sync.Mutex
 	lastTrafficUp   int64
 	lastTrafficDown int64
 	lastTrafficAt   time.Time
@@ -396,19 +397,90 @@ func (s *Server) apply(mutate func(cfg *config.Config) error) (*applyResult, err
 	}
 	res.Restarted = true
 	s.lastErr = ""
+	go s.prefetchRuleSets()
 	return res, nil
 }
 
-// build 生成内核配置对象。
-func (s *Server) build(cfg *config.Config) (*render.SBConfig, error) {
-	return render.Build(cfg, render.Context{
+// ruleSetDir 规则集本地缓存目录。
+func (s *Server) ruleSetDir() string { return filepath.Join(s.dataDir, "rules") }
+
+// renderContext 当前渲染上下文。
+func (s *Server) renderContext() render.Context {
+	return render.Context{
 		CacheFile:  filepath.Join(s.dataDir, "cache.db"),
 		ClashUI:    s.clashUIPath(),
-		RuleSetDir: filepath.Join(s.dataDir, "rules"),
+		RuleSetDir: s.ruleSetDir(),
 		// 渲染时旧内核还活着并占着 53 端口,要告诉渲染层"这个端口是我自己的",
 		// 否则 dns-in 会被当成端口冲突静默丢掉,重启后局域网 DNS 全挂。
 		KernelRunning: s.kernel.Status().Running,
-	})
+	}
+}
+
+// build 生成内核配置对象。
+//
+// 渲染两遍:第一遍拿到本次引用的规则集清单,第二遍把"本地已有缓存"的
+// 改成 type:local + path。这样内核启动不必联网下载规则集 —— 国内直连
+// github 不通,下载失败会 FATAL,整个内核起不来(全屋断网)。
+// 没缓存到的仍然退回 remote,行为和以前一致。
+func (s *Server) build(cfg *config.Config) (*render.SBConfig, error) {
+	ctx := s.renderContext()
+	sb, err := render.Build(cfg, ctx)
+	if err != nil {
+		return nil, err
+	}
+	paths := map[string]string{}
+	for _, rs := range sb.Route.RuleSet {
+		if rs.Type != "remote" || rs.URL == "" {
+			continue
+		}
+		if p := ruleset.LocalPath(s.ruleSetDir(), rs.URL, rs.Format); p != "" {
+			paths[rs.URL] = p
+		}
+	}
+	if len(paths) == 0 {
+		return sb, nil
+	}
+	ctx.RuleSetPaths = paths
+	return render.Build(cfg, ctx)
+}
+
+// prefetchRuleSets 后台把远程规则集缓存到本地,供下次启动直接使用。
+//
+// 只在后台跑,不阻塞面板保存:首次升级后第一次启动仍走 remote(经代理下载),
+// 跑完这一轮之后,下次启动就全部用本地文件,不再依赖网络和代理。
+func (s *Server) prefetchRuleSets() {
+	cfg := s.store.Current()
+	if cfg == nil {
+		return
+	}
+	sb, err := s.build(cfg)
+	if err != nil {
+		return
+	}
+	var refs []ruleset.Ref
+	seen := map[string]bool{}
+	for _, rs := range sb.Route.RuleSet {
+		if rs.Type != "remote" || rs.URL == "" || seen[rs.URL] {
+			continue
+		}
+		seen[rs.URL] = true
+		refs = append(refs, ruleset.Ref{URL: rs.URL, Format: rs.Format})
+	}
+	if len(refs) == 0 {
+		return
+	}
+	proxy := ""
+	if s.kernel.Status().Running {
+		if addr := s.localProxyAddr(); addr != "" {
+			proxy = "http://" + addr
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	res := ruleset.Ensure(ctx, s.ruleSetDir(), refs, proxy)
+	if res.Downloaded > 0 || res.Failed > 0 {
+		fmt.Printf("[规则集] 预取完成:成功 %d,失败 %d %s\n", res.Downloaded, res.Failed, strings.Join(res.Errors, "; "))
+	}
 }
 
 func (s *Server) clashUIPath() string {
@@ -455,6 +527,7 @@ func (s *Server) ApplyStartup() error {
 		s.lastErr = err.Error()
 		return nil
 	}
+	go s.prefetchRuleSets()
 	return nil
 }
 
@@ -1990,12 +2063,12 @@ type dnsStats struct {
 }
 
 type dnsUpstream struct {
-	Name              string
-	Total, Success    int
-	Failed, NXDomain  int
-	AvgMs, Rate       float64
-	durSum            float64
-	durCnt            int
+	Name             string
+	Total, Success   int
+	Failed, NXDomain int
+	AvgMs, Rate      float64
+	durSum           float64
+	durCnt           int
 }
 
 // parseLogTime 解析内核日志行开头的时间戳。
@@ -2138,6 +2211,7 @@ func (s *Server) handleConditionTypes(w http.ResponseWriter, r *http.Request) {
 //   - 跨源调 9090 会被 CORS 拦(sing-box 没有 allow_cors 这类配置);
 //   - zashboard 是 PWA,旧 Service Worker 会用失效缓存把面板打成 404,
 //     且 SW 注册脚本在跨源 iframe 里抛 SecurityError 导致整页白屏。
+//
 // 同源没有这些问题,面板启动脚本(core.js)还会顺手清掉本域历史 SW。
 func (s *Server) handleKernelUIURL(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
