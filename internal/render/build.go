@@ -1220,37 +1220,40 @@ func DefaultProxyTarget(cfg *config.Config, r *config.Resolver) string {
 // 返回值是"要追加到所有业务规则之后"的收尾规则。
 func applyDeviceRouting(rt *SBRoute, cfg *config.Config, r *config.Resolver) []SBRule {
 	ex := normalizeSourceCIDRs(cfg.Routing.ModeExceptions)
+	proxyTag := defaultProxyTarget(cfg, r)
 	if cfg.Routing.Mode == config.RouteModeDirect {
 		rt.Final = "direct"
-		// 例外设备 → 代理。这里只能放真实例外设备:
-		// 若把回环也塞进来,内核自身流量(首页测速、诊断探针)会被硬钉到代理,
-		// 连百度都会走代理 —— 测速就失真了。
-		if len(ex) > 0 {
-			rt.Rules = append(rt.Rules, SBRule{
-				ClientIP: ex, Action: "route", Outbound: defaultProxyTarget(cfg, r),
-			})
-		}
-		// 其余设备 → 直连。回环要从这条里排除,否则内核自己的测速/诊断会被
+		// 非例外设备 → 直连。回环要排除,否则内核自己的测速/诊断会被
 		// 当成"非例外设备"掐成直连。
 		guard := normalizeSourceCIDRs(append(append([]string{}, ex...), loopbackCIDRs...))
 		rt.Rules = append(rt.Rules, SBRule{
 			ClientIP: guard, Invert: true, Action: "route", Outbound: "direct",
 		})
-		// 回环本身:排在所有业务规则**之后**再兜到代理。
-		// 放前面会把百度也送进代理(国内规则还没来得及匹配);
-		// 不放的话,直连模式 final=direct,内核访问境外站点又会变成直连超时。
-		// 放最后正好是"国内走前面的直连规则、其余走代理"。
+		// 例外设备 + 回环的兜底,必须排在所有业务规则**之后**。
+		//
+		// 早期版本把"例外设备 → 代理"放在最前面,导致例外设备的所有流量
+		// 都被硬钉进代理组,INS/Youtube/Google 这些按域名匹配的规则全部失效
+		// (实测:例外设备访问 gateway.instagram.com 命中的是
+		//  source_ip_cidr=[...] => route(Proxy),而不是 INS)。
+		//
+		// 正确语义是"按规则分流,没命中时兜底走代理":
+		//   国内 → 前面的 geoipcn/geositecn 直连
+		//   境外 → 前面的 INS/Youtube/... 各自的分组
+		//   其余 → 落到这里走 Proxy
+		// 回环也放这条:直连模式 final=direct,不放的话内核测不到境外站点。
+		fallback := normalizeSourceCIDRs(append(append([]string{}, ex...), loopbackCIDRs...))
 		return []SBRule{{
-			ClientIP: loopbackCIDRs, Action: "route", Outbound: defaultProxyTarget(cfg, r),
+			ClientIP: fallback, Action: "route", Outbound: proxyTag,
 		}}
 	}
 	if len(ex) == 0 {
 		return nil
 	}
-	rt.Rules = append(rt.Rules, SBRule{
+	// 默认代理:例外设备兜底走直连,同样放到业务规则之后,
+	// 让国内/境外的正常分流逻辑优先。
+	return []SBRule{{
 		ClientIP: ex, Action: "route", Outbound: "direct",
-	})
-	return nil
+	}}
 }
 
 // loopbackCIDRs 内核自身流量的来源地址(回环)。它们不是局域网设备,

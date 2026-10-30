@@ -90,46 +90,56 @@ func TestDeviceRoutingDirectModeFinalIsDirect(t *testing.T) {
 	}
 }
 
-// 默认直连 + 例外设备:例外走代理,其余走直连。
-func TestDeviceRoutingDirectModeExceptionGoesProxy(t *testing.T) {
+// 默认直连 + 例外设备:其余设备被钉到直连,例外设备走正常分流、
+// 兜底才走代理。
+//
+// 关键点:例外设备的兜底规则必须排在**所有业务规则之后**。
+// 早期版本放在最前面,导致例外设备访问 instagram 命中的是
+// source_ip_cidr => route(Proxy),INS 规则完全失效。
+func TestDeviceRoutingDirectModeExceptionFallsThroughToProxy(t *testing.T) {
 	rt := deviceRoute(t, config.RouteModeDirect, []string{"10.10.10.35"})
 	if rt.Final != "direct" {
 		t.Fatalf("兜底出口应为 direct,实际 %q", rt.Final)
 	}
 
-	var toProxy, toDirectInverted *render.SBRule
+	var invertRule *render.SBRule
 	for i := range rt.Rules {
-		r := &rt.Rules[i]
-		if len(r.ClientIP) == 0 {
-			continue
-		}
-		if r.Invert && r.Outbound == "direct" {
-			toDirectInverted = r
-		} else if !r.Invert && r.Outbound != "direct" && !containsLoopback(r.ClientIP) {
-			toProxy = r
+		if rt.Rules[i].Invert && len(rt.Rules[i].ClientIP) > 0 {
+			invertRule = &rt.Rules[i]
 		}
 	}
-	if toProxy == nil {
-		t.Fatal("默认直连 + 例外设备:缺少「例外设备走代理」的规则")
+	if invertRule == nil {
+		t.Fatal("缺少「其余设备走直连」的反向规则")
 	}
-	if toDirectInverted == nil {
-		// 没有这条,后面按域名匹配的分流规则会把非例外设备重新送进代理,
-		// "默认直连"就形同虚设。
-		t.Fatal("默认直连 + 例外设备:缺少「其余设备走直连」的反向规则")
+	if invertRule.Outbound != "direct" {
+		t.Fatalf("反向规则应走 direct,实际 %q", invertRule.Outbound)
 	}
 
-	// 例外规则必须排在反向规则前面,否则例外设备会被反向规则先吃掉。
-	idxProxy, idxInvert := -1, -1
-	for i := range rt.Rules {
-		if &rt.Rules[i] == toProxy {
-			idxProxy = i
-		}
-		if &rt.Rules[i] == toDirectInverted {
-			idxInvert = i
+	// 例外设备的兜底必须是最后一条,且指向代理。
+	last := rt.Rules[len(rt.Rules)-1]
+	hasEx := false
+	for _, c := range last.ClientIP {
+		if c == "10.10.10.35" {
+			hasEx = true
 		}
 	}
-	if idxProxy > idxInvert {
-		t.Fatalf("「例外设备走代理」必须排在「其余设备走直连」之前(proxy=%d invert=%d)", idxProxy, idxInvert)
+	if !hasEx {
+		t.Fatalf("最后一条应是例外设备的兜底规则,实际: %+v", last)
+	}
+	if last.Outbound == "direct" {
+		t.Fatal("例外设备的兜底应指向代理")
+	}
+
+	// 而且不能出现在业务规则之前 —— 否则会抢在 INS/Youtube 之前改判。
+	for i, r := range rt.Rules {
+		if i == len(rt.Rules)-1 {
+			continue
+		}
+		for _, c := range r.ClientIP {
+			if c == "10.10.10.35" && !r.Invert && r.Outbound != "direct" {
+				t.Fatalf("例外设备的代理规则出现在第 %d 条(业务规则之前),会抢掉 INS 等分流", i)
+			}
+		}
 	}
 }
 
@@ -181,31 +191,13 @@ func TestDeviceRoutingNormalizesExceptions(t *testing.T) {
 func TestDeviceRoutingDirectModeExcludesLoopback(t *testing.T) {
 	rt := deviceRoute(t, config.RouteModeDirect, []string{"10.10.10.35"})
 
-	isLoopback := func(c string) bool { return c == "127.0.0.1/32" || c == "::1/128" }
-	hasLoopback := func(r *render.SBRule) bool {
-		for _, c := range r.ClientIP {
-			if isLoopback(c) {
-				return true
-			}
-		}
-		return false
-	}
+	hasLoopback := func(r *render.SBRule) bool { return containsLoopback(r.ClientIP) }
 
 	var invertRule *render.SBRule
-	var exceptionRule *render.SBRule
 	for i := range rt.Rules {
-		r := &rt.Rules[i]
-		if len(r.ClientIP) == 0 {
-			continue
+		if rt.Rules[i].Invert && len(rt.Rules[i].ClientIP) > 0 {
+			invertRule = &rt.Rules[i]
 		}
-		if r.Invert {
-			invertRule = r
-			continue
-		}
-		if hasLoopback(r) {
-			continue // 回环兜底规则单独检查
-		}
-		exceptionRule = r
 	}
 	if invertRule == nil {
 		t.Fatal("缺少「其余设备走直连」的反向规则")
@@ -213,17 +205,11 @@ func TestDeviceRoutingDirectModeExcludesLoopback(t *testing.T) {
 	if !hasLoopback(invertRule) {
 		t.Fatal("反向规则必须排除回环,否则内核自己的测速/诊断会被掐成直连")
 	}
-	if exceptionRule == nil {
-		t.Fatal("缺少「例外设备走代理」的规则")
-	}
-	if hasLoopback(exceptionRule) {
-		t.Fatal("回环不该出现在「例外设备→代理」里,否则内核访问国内站点也会走代理")
-	}
 
-	// 回环兜底必须排在所有业务规则之后:放前面会把百度也送进代理。
+	// 回环的兜底必须排在最后,且指向代理(直连模式 final=direct)。
 	last := rt.Rules[len(rt.Rules)-1]
 	if !hasLoopback(&last) {
-		t.Fatalf("回环兜底规则应该是最后一条(实际最后一条: %+v)", last)
+		t.Fatalf("回环兜底应是最后一条(实际: %+v)", last)
 	}
 	if last.Outbound == "direct" {
 		t.Fatal("回环兜底应指向代理,否则直连模式下内核测不到境外站点")
